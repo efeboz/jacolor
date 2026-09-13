@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# numba cache=True artifacts
+*.nbi
+*.nbc
+
+# internal, not shipped
+PLAN.md
+
+.DS_Store
+.idea/
+.vscode/
