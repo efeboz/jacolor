@@ -51,7 +51,7 @@ def decompress(B, P, coloring):
     ci = torch.from_numpy(P.indices.astype(np.int64)).to(B.device)
     kc = torch.as_tensor(coloring.colors).to(B.device)
     vals = B[ri, kc[ci]] if coloring.axis == "cols" else B[kc[ri], ci]
-    # Indices are already in coalesced order, so coalesce() only sets the flag.
+    # Canonical CSR has no repeats, so coalesce() cannot merge two entries here.
     return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
 
 

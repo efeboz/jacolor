@@ -10,7 +10,17 @@ than assumed.
 import numpy as np
 import scipy.sparse as sp
 
-__all__ = ["check", "from_pairs", "from_dense", "transpose", "matmul", "row_nnz"]
+__all__ = [
+    "check",
+    "from_pairs",
+    "from_dense",
+    "eye",
+    "transpose",
+    "matmul",
+    "union",
+    "gather",
+    "row_nnz",
+]
 
 
 def check(M):
@@ -19,6 +29,11 @@ def check(M):
         raise TypeError(f"expected a CSR pattern, got {type(M).__name__}")
     if M.dtype != np.bool_:
         raise TypeError(f"pattern dtype must be bool, got {M.dtype}")
+    if not M.has_canonical_format:
+        # spgemm output comes back unsorted, and a hand-built CSR may repeat an
+        # index. Canonical form (sorted rows, no repeats) is what row_nnz and
+        # decompress rely on. On bool, merging repeats is OR.
+        M.sum_duplicates()
     return M
 
 
@@ -34,12 +49,30 @@ def from_dense(a):
     return check(sp.csr_array(np.asarray(a, dtype=np.bool_)))
 
 
+def eye(n):
+    # Identity pattern: element i of an input depends on input variable i.
+    return check(sp.eye_array(n, dtype=np.bool_, format="csr"))
+
+
 def transpose(M):
     return check(sp.csr_array(check(M).T))
 
 
 def matmul(A, B):
     return check(check(A) @ check(B))
+
+
+def union(*Ms):
+    # Elementwise OR. On bool CSR, + is logical OR, same as accumulation.
+    out = check(Ms[0])
+    for M in Ms[1:]:
+        out = check(out + check(M))
+    return out
+
+
+def gather(M, src):
+    # Row map: output row i takes input row src[i]. Repeats and drops allowed.
+    return check(check(M)[np.asarray(src, dtype=np.int64)])
 
 
 def row_nnz(M):
