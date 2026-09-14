@@ -17,7 +17,7 @@ def test_canary_300_way_accumulation():
 
 
 def test_canary_256_coincident_entries():
-    # 256 is the exact int8/uint8 wrap point; bool must still hold the entry.
+    # 256 is the exact int8/uint8 wrap point. bool must still hold the entry.
     k = 256
     P = bc.from_pairs(np.zeros(k, dtype=np.int64), np.zeros(k, dtype=np.int64), shape=(1, 1))
     assert P.toarray().tolist() == [[True]]

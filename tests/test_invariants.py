@@ -5,7 +5,7 @@ import numpy as np
 
 from src import _boolcsr as bc
 
-PKG = pathlib.Path(__file__).resolve().parents[1] / "jacolor"
+PKG = pathlib.Path(__file__).resolve().parents[1] / "src"
 
 # _boolcsr.py is bool-only: pattern values are bool, index arrays are int64,
 # nothing else. int8/uint8 values are the exact wrap hazard, and a float dtype
