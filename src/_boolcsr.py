@@ -1,9 +1,10 @@
 """Boolean CSR pattern storage.
 
 Every sparsity pattern in jacolor lives here, and every pattern is dtype=bool.
-SciPy's sparsetools accumulate bool with logical OR; integer dtypes wrap, so 256
-coincident contributions to one entry sum to 0 and the entry vanishes from the
-pattern. A missing entry is an unsound Jacobian, so bool is enforced, not assumed.
+SciPy's sparsetools accumulate bool with logical OR. Integer dtypes wrap instead,
+so 256 coincident contributions to one entry sum to 0 and the entry leaves the
+pattern. A missing entry is an unsound Jacobian, so bool is enforced here rather
+than assumed.
 """
 
 import numpy as np
@@ -22,7 +23,7 @@ def check(M):
 
 
 def from_pairs(rows, cols, shape):
-    # Coordinate pairs may repeat; duplicates OR together on the COO->CSR sum.
+    # Coordinate pairs may repeat. Duplicates OR together on the COO->CSR sum.
     rows = np.asarray(rows, dtype=np.int64)
     cols = np.asarray(cols, dtype=np.int64)
     vals = np.ones(rows.size, dtype=np.bool_)

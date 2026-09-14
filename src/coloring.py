@@ -2,7 +2,7 @@
 
 A set of columns may share one AD seed vector iff no two of them have a nonzero
 in the same row. That condition is distance-1 coloring of the column-intersection
-graph A = P^T P, whose edge (c, c') exists iff columns c and c' share a row, so
+graph A = P^T P, whose edge (c, c') exists iff columns c and c' share a row. So
 no distance-2 walk over the bipartite pattern is needed.
 
 Rows are the same construction on P @ P^T, which is column coloring of P^T.
@@ -17,7 +17,7 @@ from . import _boolcsr as bc
 
 __all__ = ["Coloring", "color_cols", "color_rows", "ORDERS"]
 
-# Orderings tried by default; the one giving the fewest colors wins.
+# Orderings tried by default. The one giving the fewest colors wins.
 ORDERS = ("natural", "lf", "sl")
 
 # Above this many columns the pure-Python greedy loop gets slow.
@@ -27,18 +27,19 @@ _SLOW_ABOVE = 10_000
 class Coloring:
     """Result of coloring one axis of a pattern."""
 
-    __slots__ = ("colors", "n_colors", "lower_bound", "order")
+    __slots__ = ("colors", "n_colors", "lower_bound", "order", "axis")
 
-    def __init__(self, colors, n_colors, lower_bound, order):
-        self.colors = colors  # color index per column, shape (n_cols,)
+    def __init__(self, colors, n_colors, lower_bound, order, axis):
+        self.colors = colors  # color index per column (or row), shape (n,)
         self.n_colors = n_colors
-        self.lower_bound = lower_bound  # densest row of P: no coloring beats it
+        self.lower_bound = lower_bound  # densest line of P: no coloring beats it
         self.order = order  # ordering that produced this result
+        self.axis = axis  # "cols" for forward mode, "rows" for reverse
 
     def __repr__(self):
         return (
-            f"Coloring(n_colors={self.n_colors}, lower_bound={self.lower_bound}, "
-            f"order={self.order!r})"
+            f"Coloring(axis={self.axis!r}, n_colors={self.n_colors}, "
+            f"lower_bound={self.lower_bound}, order={self.order!r})"
         )
 
 
@@ -78,8 +79,8 @@ def _degrees(A):
 
 
 def _smallest_last(indptr, indices, deg):
-    # Repeatedly strip a minimum-degree vertex; the order is the reverse of
-    # removal. Lazy-deletion heap: stale entries are dropped when popped.
+    # Repeatedly strip a minimum-degree vertex. The order is the reverse of
+    # removal. Lazy-deletion heap, so stale entries are dropped when popped.
     n = deg.size
     d = deg.copy()
     alive = np.ones(n, dtype=bool)
@@ -118,8 +119,8 @@ def color_cols(P, orders=ORDERS):
     n = P.shape[1]
     if n > _SLOW_ABOVE and not HAS_NUMBA:
         warnings.warn(
-            f"coloring {n} columns with the pure-Python greedy loop; "
-            "install jacolor[fast] for the numba kernel",
+            f"coloring {n} columns with the pure-Python greedy loop. "
+            "Install jacolor[fast] for the numba kernel",
             stacklevel=2,
         )
     A = bc.matmul(bc.transpose(P), P)
@@ -131,10 +132,11 @@ def color_cols(P, orders=ORDERS):
         colors = _greedy(A.indptr, A.indices, _perm(name, A, deg), n)
         n_colors = int(colors.max()) + 1 if n else 0
         if best is None or n_colors < best.n_colors:
-            best = Coloring(colors, n_colors, lb, name)
+            best = Coloring(colors, n_colors, lb, name, "cols")
     return best
 
 
 def color_rows(P, orders=ORDERS):
     """Color the rows of pattern `P` for reverse-mode seeding."""
-    return color_cols(bc.transpose(P), orders=orders)
+    c = color_cols(bc.transpose(P), orders=orders)
+    return Coloring(c.colors, c.n_colors, c.lower_bound, c.order, "rows")
