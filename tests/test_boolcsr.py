@@ -1,3 +1,6 @@
+import pathlib
+import re
+
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -71,3 +74,35 @@ def test_every_op_returns_canonical_csr():
             for r in range(Q.shape[0]):
                 row = Q.indices[Q.indptr[r]:Q.indptr[r + 1]]
                 assert np.all(np.diff(row) > 0)
+
+
+# _boolcsr.py is bool-only: pattern values are bool, index arrays are int64,
+# nothing else. int8/uint8 values are the exact wrap hazard, and a float dtype
+# has no business here at all.
+_BANNED = re.compile(
+    r"\b(?:np|numpy)\.(?!bool_?\b|int64\b)"
+    r"(u?int\d*|float\d*|complex\d*|u?byte|short|longlong|double|single)\b"
+)
+
+
+def test_boolcsr_uses_no_dtype_but_bool_and_int64():
+    for i, line in enumerate((pathlib.Path(__file__).resolve().parents[1] / "src" / "_boolcsr.py").read_text().splitlines(), 1):
+        code = line.split("#", 1)[0]
+        hit = _BANNED.search(code)
+        assert hit is None, f"_boolcsr.py:{i} uses banned dtype {hit.group(0)!r}"
+
+
+def test_check_drops_stored_false():
+    # A stored False is an index without an entry. Left in, row_nnz would count
+    # it and decompress would write a value there.
+    M = sp.csr_array(
+        (np.array([True, False, True]), np.array([0, 1, 1]), np.array([0, 2, 3])), shape=(2, 2)
+    )
+    M = bc.check(M)
+    assert M.nnz == 2 and M.data.all()
+    assert bc.row_nnz(M).tolist() == [1, 1]
+
+
+def test_true_and_false_at_one_index_is_true():
+    M = sp.csr_array((np.array([False, True]), np.array([0, 0]), np.array([0, 2])), shape=(1, 1))
+    assert bc.check(M).toarray().tolist() == [[True]]

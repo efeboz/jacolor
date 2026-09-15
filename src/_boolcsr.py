@@ -18,6 +18,7 @@ __all__ = [
     "transpose",
     "matmul",
     "union",
+    "vstack",
     "gather",
     "row_nnz",
 ]
@@ -34,6 +35,11 @@ def check(M):
         # index. Canonical form (sorted rows, no repeats) is what row_nnz and
         # decompress rely on. On bool, merging repeats is OR.
         M.sum_duplicates()
+    if M.nnz and not M.data.all():
+        # A stored False is an index without an entry. Coloring reads values and
+        # decompress reads indices, so the two would disagree about it and
+        # decompress would write a Jacobian value where the pattern has none.
+        M.eliminate_zeros()
     return M
 
 
@@ -51,7 +57,8 @@ def from_dense(a):
 
 def eye(n):
     # Identity pattern: element i of an input depends on input variable i.
-    return check(sp.eye_array(n, dtype=np.bool_, format="csr"))
+    i = np.arange(n, dtype=np.int64)
+    return from_pairs(i, i, (n, n))
 
 
 def transpose(M):
@@ -68,6 +75,11 @@ def union(*Ms):
     for M in Ms[1:]:
         out = check(out + check(M))
     return out
+
+
+def vstack(Ms):
+    # Row concatenation, keeping each input's rows contiguous and in order.
+    return check(sp.vstack([check(M) for M in Ms], format="csr"))
 
 
 def gather(M, src):

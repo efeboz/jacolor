@@ -24,17 +24,42 @@ ORDERS = ("natural", "lf", "sl")
 _SLOW_ABOVE = 10_000
 
 
+def _conflict(L, colors):
+    # Some row of L holds two entries of one color, so decompression would read
+    # a single compressed value back for two different Jacobian entries.
+    if L.nnz == 0:
+        return False
+    rows = np.repeat(np.arange(L.shape[0], dtype=np.int64), bc.row_nnz(L))
+    keys = rows * (int(colors.max()) + 1) + colors[L.indices]
+    return np.unique(keys).size != keys.size
+
+
 class Coloring:
-    """Result of coloring one axis of a pattern."""
+    """A coloring together with the pattern it is valid for.
 
-    __slots__ = ("colors", "n_colors", "lower_bound", "order", "axis")
+    The pattern is copied in and checked once here, so decompression can never
+    pair a coloring with a pattern it does not fit.
+    """
 
-    def __init__(self, colors, n_colors, lower_bound, order, axis):
+    __slots__ = ("colors", "n_colors", "lower_bound", "order", "axis", "pattern")
+
+    def __init__(self, colors, n_colors, lower_bound, order, axis, pattern):
+        if axis not in ("cols", "rows"):
+            raise ValueError(f"axis must be 'cols' or 'rows', got {axis!r}")
+        P = bc.check(pattern).copy()
+        L = P if axis == "cols" else bc.transpose(P)  # colored lines are L's columns
+        colors = np.asarray(colors, dtype=np.int64)
+        if colors.size != L.shape[1]:
+            raise ValueError(f"{colors.size} colors for {L.shape[1]} {axis}")
+        if _conflict(L, colors):
+            other = "row" if axis == "cols" else "column"
+            raise ValueError(f"coloring is invalid: two {axis} sharing a {other} have one color")
         self.colors = colors  # color index per column (or row), shape (n,)
         self.n_colors = n_colors
         self.lower_bound = lower_bound  # densest line of P: no coloring beats it
         self.order = order  # ordering that produced this result
         self.axis = axis  # "cols" for forward mode, "rows" for reverse
+        self.pattern = P  # the pattern, in its original orientation
 
     def __repr__(self):
         return (
@@ -113,15 +138,15 @@ def _perm(name, A, deg):
     raise ValueError(f"unknown ordering {name!r}, expected one of {ORDERS}")
 
 
-def color_cols(P, orders=ORDERS):
-    """Color the columns of pattern `P` for forward-mode seeding."""
+def _best(P, orders):
+    # Greedy over each ordering on A = P^T P, keeping the fewest colors.
     P = bc.check(P)
     n = P.shape[1]
     if n > _SLOW_ABOVE and not HAS_NUMBA:
         warnings.warn(
             f"coloring {n} columns with the pure-Python greedy loop. "
             "Install jacolor[fast] for the numba kernel",
-            stacklevel=2,
+            stacklevel=3,
         )
     A = bc.matmul(bc.transpose(P), P)
     deg = _degrees(A)
@@ -130,13 +155,17 @@ def color_cols(P, orders=ORDERS):
     best = None
     for name in orders:
         colors = _greedy(A.indptr, A.indices, _perm(name, A, deg), n)
-        n_colors = int(colors.max()) + 1 if n else 0
-        if best is None or n_colors < best.n_colors:
-            best = Coloring(colors, n_colors, lb, name, "cols")
+        k = int(colors.max()) + 1 if n else 0
+        if best is None or k < best[1]:
+            best = (colors, k, lb, name)
     return best
 
 
+def color_cols(P, orders=ORDERS):
+    """Color the columns of pattern P for forward-mode seeding."""
+    return Coloring(*_best(P, orders), "cols", P)
+
+
 def color_rows(P, orders=ORDERS):
-    """Color the rows of pattern `P` for reverse-mode seeding."""
-    c = color_cols(bc.transpose(P), orders=orders)
-    return Coloring(c.colors, c.n_colors, c.lower_bound, c.order, "rows")
+    """Color the rows of pattern P for reverse-mode seeding."""
+    return Coloring(*_best(bc.transpose(P), orders), "rows", P)

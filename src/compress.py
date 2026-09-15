@@ -19,10 +19,10 @@ __all__ = ["seeds", "decompress"]
 
 
 def seeds(coloring, dtype=None, device=None):
-    """Seed matrix for `coloring`.
+    """Seed matrix for coloring.
 
-    Forward (`axis="cols"`): shape (n_cols, n_colors), column k is the tangent
-    for color k. Reverse (`axis="rows"`): shape (n_colors, n_rows), row k is the
+    Forward (axis="cols"): shape (n_cols, n_colors), column k is the tangent
+    for color k. Reverse (axis="rows"): shape (n_colors, n_rows), row k is the
     cotangent for color k.
     """
     n = coloring.colors.size
@@ -39,35 +39,24 @@ def seeds(coloring, dtype=None, device=None):
     return S
 
 
-def decompress(B, P, coloring):
-    """Scatter compressed AD results `B` back onto pattern `P`.
+def decompress(B, coloring):
+    """Scatter compressed AD results B back onto the coloring's pattern.
 
-    Returns a coalesced sparse COO tensor holding exactly `P`'s nonzeros.
+    Returns a coalesced sparse COO tensor holding exactly the pattern's
+    nonzeros. The pattern travels with the coloring, so the two always fit.
     """
-    bc.check(P)
-    _check_fit(B, P, coloring)
-    # Row and column index of every pattern nonzero, in CSR order.
-    ri = torch.from_numpy(np.repeat(np.arange(P.shape[0]), bc.row_nnz(P))).to(B.device)
-    ci = torch.from_numpy(P.indices.astype(np.int64)).to(B.device)
-    kc = torch.as_tensor(coloring.colors).to(B.device)
-    vals = B[ri, kc[ci]] if coloring.axis == "cols" else B[kc[ri], ci]
-    # Canonical CSR has no repeats, so coalesce() cannot merge two entries here.
-    return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
-
-
-def _check_fit(B, P, coloring):
+    P = coloring.pattern
     m, n = P.shape
-    if coloring.axis == "cols":
-        n_lines, want = n, (m, coloring.n_colors)
-    else:
-        n_lines, want = m, (coloring.n_colors, n)
-    if coloring.colors.size != n_lines:
-        raise ValueError(
-            f"coloring covers {coloring.colors.size} {coloring.axis}, "
-            f"pattern has {n_lines}"
-        )
+    want = (m, coloring.n_colors) if coloring.axis == "cols" else (coloring.n_colors, n)
     if tuple(B.shape) != want:
         raise ValueError(
             f"compressed result for axis={coloring.axis!r} should have shape "
             f"{want}, got {tuple(B.shape)}"
         )
+    # Row and column index of every pattern nonzero, in CSR order.
+    ri = torch.from_numpy(np.repeat(np.arange(m), bc.row_nnz(P))).to(B.device)
+    ci = torch.from_numpy(P.indices.astype(np.int64)).to(B.device)
+    kc = torch.as_tensor(coloring.colors).to(B.device)
+    vals = B[ri, kc[ci]] if coloring.axis == "cols" else B[kc[ri], ci]
+    # Canonical CSR has no repeats, so coalesce() cannot merge two entries here.
+    return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
