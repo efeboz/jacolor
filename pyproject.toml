@@ -14,19 +14,22 @@ dependencies = [
     # decomposition table changed materially before it.
     "torch>=2.6",
     "numpy>=1.24",
-    "scipy>=1.10",
+    "scipy>=1.14",  # 1.14.1 is the oldest the suite has passed on
 ]
 
 [project.optional-dependencies]
 fast = ["numba>=0.59"]
 dev = [
     "pytest>=8",
-    "hypothesis>=6",
-    "networkx>=3",
+    "networkx>=3",  # independent coloring reference
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["jacolor"]
+# Sources live flat in src/; the wheel ships them as the jacolor package.
+# (This rename rules out `pip install -e .` -- hatchling refuses editable
+# installs when a sources rewrite changes a prefix. Tests import from src.)
+only-include = ["src"]
+sources = { "src" = "jacolor" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
