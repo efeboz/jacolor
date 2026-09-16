@@ -4,7 +4,7 @@ import torch
 
 from src import _boolcsr as bc, coloring as cl
 from src.compress import decompress, seeds
-from src.trace import CustomBackward, UnsupportedOp, sparsity
+from src.trace import CustomBackward, TraceMismatch, UnsupportedOp, sparsity
 
 F64 = torch.float64
 CONV = torch.nn.functional.conv2d
@@ -228,13 +228,11 @@ class TestRefusals:
         with pytest.raises(CustomBackward, match="Widen"):
             sparsity(lambda z: Widen.apply(z) * 2.0, torch.randn(4, dtype=F64))
 
-    def test_apply_is_restored_after_a_refusal(self):
-        from torch.autograd.function import Function
-
-        before = Function.__dict__["apply"]
+    def test_a_refusal_leaves_tracing_usable(self):
+        # Detection no longer patches Function.apply, but a refusal still has to
+        # leave no global state behind.
         with pytest.raises(CustomBackward):
             sparsity(lambda z: Widen.apply(z), torch.randn(4, dtype=F64))
-        assert Function.__dict__["apply"] is before
         assert sparsity(torch.sin, torch.randn(3, dtype=F64)).nnz == 3
 
 
@@ -285,3 +283,80 @@ def test_random_traced_chains_contain_the_true_jacobian(seed):
 
     x = torch.randn(n, dtype=F64)
     assert_contains(sparsity(f, x), f, x, points=3, seed=seed)
+
+
+class Cached(torch.autograd.Function):
+    """Forward reads only z[0], backward sends gradient everywhere."""
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(z):
+        return z[0].expand(z.shape[0]).clone()
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        pass
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
+
+    @staticmethod
+    def jvp(ctx, gz):
+        return gz
+
+
+CACHED_APPLY = Cached.apply  # captured before any tracing, as a user might
+
+_W = torch.randn(3, 2, 3, 3, generator=torch.Generator().manual_seed(15), dtype=F64)
+
+
+class TestTraceFidelity:
+    """The trace has to stand for the function autograd will differentiate."""
+
+    def test_export_specialized_branch_is_refused(self):
+        # Export takes the is_compiling branch, so the traced program computes z
+        # while f computes z + z.sum(). The pattern would be the wrong shape of
+        # dependency entirely, and the values silently wrong with it.
+        f = lambda z: z if torch.compiler.is_compiling() else z + z.sum()
+        with pytest.raises(TraceMismatch, match="does not agree with f"):
+            sparsity(f, torch.randn(3, dtype=F64))
+
+    def test_apply_captured_before_tracing_is_caught(self):
+        # Replacing Function.apply cannot see this call. The autograd graph can.
+        with pytest.raises(CustomBackward, match="Cached"):
+            sparsity(lambda z: CACHED_APPLY(z), torch.randn(4, dtype=F64))
+
+    def test_apply_through_the_class_is_caught(self):
+        with pytest.raises(CustomBackward, match="Cached"):
+            sparsity(lambda z: Cached.apply(z), torch.randn(4, dtype=F64))
+
+    def test_a_custom_function_off_the_derivative_path_is_allowed(self):
+        # It runs on a constant, so it cannot affect the Jacobian.
+        k = torch.ones(4, dtype=F64)
+        f = lambda z: z * CACHED_APPLY(k).sum()
+        assert sparsity(f, torch.randn(4, dtype=F64)).nnz == 4
+
+    def test_a_random_op_on_the_input_is_refused(self):
+        # randn_like takes the tracked input, so the missing-rule guard gets it
+        # first. Refused either way, which is the point.
+        with pytest.raises(UnsupportedOp, match="randn_like"):
+            sparsity(lambda z: z * torch.randn_like(z), torch.randn(4, dtype=F64))
+
+    def test_a_random_constant_makes_the_trace_disagree(self):
+        # The constant has no tracked input, so it runs as data and every call
+        # draws a different one. No single pattern describes f, and a traced
+        # sample would look authoritative.
+        with pytest.raises(TraceMismatch):
+            sparsity(lambda z: z * torch.randn(4, dtype=F64), torch.randn(4, dtype=F64))
+
+    @pytest.mark.parametrize("name,f,x", [
+        ("banded", band, torch.randn(12, dtype=F64)),
+        ("conv", lambda z: CONV(z.reshape(1, 2, 5, 5), _W, padding=1).reshape(-1),
+         torch.randn(50, dtype=F64)),
+        ("softmax", lambda z: torch.softmax(z.reshape(2, 3), dim=1).reshape(-1),
+         torch.randn(6, dtype=F64)),
+    ])
+    def test_no_false_positives_on_ordinary_code(self, name, f, x):
+        assert sparsity(f, x).nnz > 0

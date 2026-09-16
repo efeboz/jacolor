@@ -169,6 +169,27 @@ class TestColoringFitsItsPattern:
         with pytest.raises(ValueError, match="axis must be"):
             cl.Coloring(np.array([0]), 1, 1, "natural", "diag", bc.eye(1))
 
+    @pytest.mark.parametrize("labels", [np.array([0, 2]), np.array([-1, 0])])
+    def test_labels_outside_the_range_are_rejected(self, labels):
+        # A line whose color is never seeded is never written, so its entries
+        # would keep whatever the result buffer happened to hold.
+        with pytest.raises(ValueError, match="colors must lie in"):
+            cl.Coloring(labels, 2, 1, "natural", "cols", bc.eye(2))
+
+    def test_float_labels_are_rejected(self):
+        with pytest.raises(ValueError, match="colors must be integers"):
+            cl.Coloring(np.array([0.0, 1.0]), 2, 1, "natural", "cols", bc.eye(2))
+
+    def test_two_dimensional_labels_are_rejected(self):
+        with pytest.raises(ValueError, match="one-dimensional"):
+            cl.Coloring(np.zeros((2, 1), dtype=np.int64), 1, 1, "natural", "cols", bc.eye(2))
+
+    def test_the_stored_labels_are_a_copy(self):
+        labels = np.array([0, 1])
+        c = cl.Coloring(labels, 2, 1, "natural", "cols", bc.eye(2))
+        labels[:] = 0
+        assert c.colors.tolist() == [0, 1]
+
     def test_pattern_is_copied(self):
         # Editing the caller's matrix afterwards must not move the pattern the
         # coloring decompresses onto.

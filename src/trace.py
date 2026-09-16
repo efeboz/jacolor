@@ -12,12 +12,11 @@ sees.
 """
 
 import torch
-from torch.autograd.function import Function
 
 from . import _boolcsr as bc
 from . import propagate as pr
 
-__all__ = ["sparsity", "UnsupportedOp", "CustomBackward"]
+__all__ = ["sparsity", "UnsupportedOp", "CustomBackward", "TraceMismatch"]
 
 aten = torch.ops.aten
 
@@ -27,7 +26,11 @@ class UnsupportedOp(NotImplementedError):
 
 
 class CustomBackward(RuntimeError):
-    """A custom autograd.Function ran while tracing. Its backward is invisible."""
+    """A custom autograd.Function takes part in the derivative of f."""
+
+
+class TraceMismatch(RuntimeError):
+    """The traced program does not compute what f computes."""
 
 
 def _where(node):
@@ -152,32 +155,33 @@ def _anchor(f):
     return key
 
 
+def _eager(f, x):
+    # One eager pass, used for two checks. Any custom autograd.Function that
+    # takes part in the derivative leaves a BackwardCFunction node in the graph,
+    # which is visible however apply was reached, including an apply captured
+    # into a local name before tracing.
+    xr = x.detach().clone().requires_grad_(True)
+    y = f(xr)
+    seen, stack, found = set(), [getattr(y, "grad_fn", None)], set()
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, torch.autograd.function.BackwardCFunction):
+            found.add(type(node).__name__)
+        stack.extend(p for p, _ in getattr(node, "next_functions", ()))
+    return y.detach(), sorted(found)
+
+
 def _export(f, x):
-    # Watch Function.apply while exporting. The export itself traces straight
-    # through a custom Function and keeps only its forward.
     mod = f if isinstance(f, torch.nn.Module) else _Wrap(f)
-    seen = []
-    orig = Function.__dict__["apply"]
-
-    def spy(cls, *a, **k):
-        seen.append(f"{cls.__module__}.{cls.__qualname__}")
-        return orig.__func__(cls, *a, **k)
-
     key = _anchor(f)
-    Function.apply = classmethod(spy)
     try:
-        ep = torch.export.export(mod, (x,), strict=False).run_decompositions()
+        return torch.export.export(mod, (x,), strict=False).run_decompositions()
     finally:
-        Function.apply = orig
         if key is not None:
             torch.fx.proxy._STACK_TRACE_ANCHORS.discard(key)
-    if seen:
-        raise CustomBackward(
-            f"custom autograd.Function {', '.join(sorted(set(seen)))} ran while tracing. "
-            "The trace keeps its forward only, so the pattern could miss what its "
-            "backward does."
-        )
-    return ep
 
 
 def _vals(a, val):
@@ -241,7 +245,9 @@ def _walk(ep, x):
             raise _refuse(node, f"graph node kind {node.op!r} is not handled")
 
     P = pat.get(res)
-    return P if P is not None else bc.from_pairs([], [], (val[res].numel(), x.numel()))
+    if P is None:
+        P = bc.from_pairs([], [], (val[res].numel(), x.numel()))
+    return P, val[res]
 
 
 def sparsity(f, x):
@@ -250,6 +256,24 @@ def sparsity(f, x):
     Holds for every input of x's shape on which f takes the same path through its
     code. Control flow on the values of x is outside that, and export refuses it.
     """
+    y, custom = _eager(f, x)
+    if custom:
+        raise CustomBackward(
+            f"the derivative of f goes through a custom autograd.Function "
+            f"({', '.join(custom)}). A trace keeps its forward only, so the pattern "
+            "could miss what its backward does."
+        )
     ep = _export(f, x)
     with torch.no_grad():
-        return _walk(ep, x)
+        P, traced = _walk(ep, x)
+    # Export may specialize a branch, so the traced program can compute something
+    # other than f. A pattern taken from it would then describe the wrong function.
+    same = traced.shape == y.shape and torch.allclose(traced, y, rtol=1e-9, atol=1e-12,
+                                                      equal_nan=True)
+    if not same:
+        raise TraceMismatch(
+            "the traced program does not agree with f on the example input, so the "
+            "pattern would describe a different function. This happens when export "
+            "specializes a branch, as with torch.compiler.is_compiling()."
+        )
+    return P

@@ -23,6 +23,10 @@ ORDERS = ("natural", "lf", "sl")
 # Above this many columns the pure-Python greedy loop gets slow.
 _SLOW_ABOVE = 10_000
 
+# Refuse to build a column-intersection graph larger than this. At roughly 9
+# bytes an entry that is about 1.8 GB. Measured patterns sit near a million.
+_MAX_EDGES = 200_000_000
+
 
 def _conflict(L, colors):
     # Some row of L holds two entries of one color, so decompression would read
@@ -48,13 +52,25 @@ class Coloring:
             raise ValueError(f"axis must be 'cols' or 'rows', got {axis!r}")
         P = bc.check(pattern).copy()
         L = P if axis == "cols" else bc.transpose(P)  # colored lines are L's columns
-        colors = np.asarray(colors, dtype=np.int64)
+        colors = np.asarray(colors)
+        if not np.issubdtype(colors.dtype, np.integer):
+            raise ValueError(f"colors must be integers, got dtype {colors.dtype}")
+        if colors.ndim != 1:
+            raise ValueError(f"colors must be one-dimensional, got shape {colors.shape}")
+        colors = colors.astype(np.int64)
         if colors.size != L.shape[1]:
             raise ValueError(f"{colors.size} colors for {L.shape[1]} {axis}")
+        # A label outside the range leaves its lines unseeded, so their entries
+        # would never be written and would keep whatever the buffer held.
+        if colors.size and (colors.min() < 0 or colors.max() >= n_colors):
+            raise ValueError(
+                f"colors must lie in 0 to {n_colors - 1}, got "
+                f"{colors.min()} to {colors.max()}"
+            )
         if _conflict(L, colors):
             other = "row" if axis == "cols" else "column"
             raise ValueError(f"coloring is invalid: two {axis} sharing a {other} have one color")
-        self.colors = colors  # color index per column (or row), shape (n,)
+        self.colors = colors.copy()  # color index per column (or row), shape (n,)
         self.n_colors = n_colors
         self.lower_bound = lower_bound  # densest line of P: no coloring beats it
         self.order = order  # ordering that produced this result
@@ -147,6 +163,19 @@ def _best(P, orders):
             f"coloring {n} columns with the pure-Python greedy loop. "
             "Install jacolor[fast] for the numba kernel",
             stacklevel=3,
+        )
+    # A row with k nonzeros contributes at most k * k pairs to A, so the cost is
+    # known before the product is built. The bound is loose where columns share
+    # many rows, which is exactly where the product is cheap anyway.
+    rn = bc.row_nnz(P).astype(np.int64)
+    # The graph cannot hold more than one entry per ordered pair of columns, so
+    # the pair count is only a bound while the columns outnumber the pairs.
+    edges = min(int((rn * rn).sum()), n * n)
+    if edges > _MAX_EDGES:
+        raise MemoryError(
+            f"the column-intersection graph could hold up to {edges} entries, about "
+            f"{edges * 9 / 1e9:.1f} GB. The densest row has {int(rn.max())} nonzeros, "
+            f"so no coloring can use fewer than {int(rn.max())} colors here."
         )
     A = bc.matmul(bc.transpose(P), P)
     deg = _degrees(A)

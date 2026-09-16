@@ -18,25 +18,35 @@ from . import _boolcsr as bc
 __all__ = ["seeds", "decompress"]
 
 
-def seeds(coloring, dtype=None, device=None):
-    """Seed matrix for coloring.
+def _block(coloring, lo, hi, dtype, device):
+    # Seed columns for colors lo up to hi, as (n_lines, hi - lo). Lines whose
+    # color falls outside the range contribute nothing to this block.
+    n = coloring.colors.size
+    kc = torch.as_tensor(coloring.colors).to(device)
+    keep = (kc >= lo) & (kc < hi)
+    S = torch.zeros(n, hi - lo, dtype=dtype, device=device)
+    S[torch.arange(n, device=device)[keep], kc[keep] - lo] = 1
+    return S
 
-    Forward (axis="cols"): shape (n_cols, n_colors), column k is the tangent
-    for color k. Reverse (axis="rows"): shape (n_colors, n_rows), row k is the
+
+def _index(P, coloring, device):
+    # Row, column and owning color of every pattern nonzero, in CSR order.
+    ri = torch.from_numpy(np.repeat(np.arange(P.shape[0]), bc.row_nnz(P))).to(device)
+    ci = torch.from_numpy(P.indices.astype(np.int64)).to(device)
+    kc = torch.as_tensor(coloring.colors).to(device)
+    return ri, ci, (kc[ci] if coloring.axis == "cols" else kc[ri])
+
+
+def seeds(coloring, dtype=None, device=None):
+    """Seed matrix for a coloring.
+
+    Forward (axis "cols"): shape (n_cols, n_colors), column k is the tangent for
+    color k. Reverse (axis "rows"): shape (n_colors, n_rows), row k is the
     cotangent for color k.
     """
-    n = coloring.colors.size
-    k = coloring.n_colors
-    line = torch.arange(n, device=device)  # one seed entry per colored column/row
-    kc = torch.as_tensor(coloring.colors).to(device)  # color of each line
     dtype = torch.get_default_dtype() if dtype is None else dtype
-    if coloring.axis == "cols":
-        S = torch.zeros(n, k, dtype=dtype, device=device)
-        S[line, kc] = 1
-    else:
-        S = torch.zeros(k, n, dtype=dtype, device=device)
-        S[kc, line] = 1
-    return S
+    S = _block(coloring, 0, coloring.n_colors, dtype, device)
+    return S if coloring.axis == "cols" else S.T.contiguous()
 
 
 def decompress(B, coloring):
@@ -53,10 +63,7 @@ def decompress(B, coloring):
             f"compressed result for axis={coloring.axis!r} should have shape "
             f"{want}, got {tuple(B.shape)}"
         )
-    # Row and column index of every pattern nonzero, in CSR order.
-    ri = torch.from_numpy(np.repeat(np.arange(m), bc.row_nnz(P))).to(B.device)
-    ci = torch.from_numpy(P.indices.astype(np.int64)).to(B.device)
-    kc = torch.as_tensor(coloring.colors).to(B.device)
-    vals = B[ri, kc[ci]] if coloring.axis == "cols" else B[kc[ri], ci]
+    ri, ci, line = _index(P, coloring, B.device)
+    vals = B[ri, line] if coloring.axis == "cols" else B[line, ci]
     # Canonical CSR has no repeats, so coalesce() cannot merge two entries here.
     return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()

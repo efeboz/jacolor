@@ -155,14 +155,13 @@ def mm(Pa, Pb, m, k, n):
     """
     if Pa is None and Pb is None:
         raise ValueError("mm needs at least one tracked operand")
-    i, l = np.divmod(np.arange(m * n, dtype=np.int64), n)
-    j = np.arange(k, dtype=np.int64)
-    out_idx = np.repeat(np.arange(m * n, dtype=np.int64), k)
+    # Union each row of a and each column of b once, then hand every output its
+    # pair. Pairing outputs with terms directly would cost m * n * k.
     parts = []
     if Pa is not None:
-        parts.append(couple(Pa, out_idx, (i[:, None] * k + j).reshape(-1), m * n))
+        parts.append(gather(reduce_sum(Pa, (m, k), (1,)), reduce_src((m, n), (1,))))
     if Pb is not None:
-        parts.append(couple(Pb, out_idx, (j[None, :] * n + l[:, None]).reshape(-1), m * n))
+        parts.append(gather(reduce_sum(Pb, (k, n), (0,)), reduce_src((m, n), (0,))))
     return union(*parts)
 
 
