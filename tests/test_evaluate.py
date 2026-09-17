@@ -1,9 +1,11 @@
+import warnings
+
 import numpy as np
 import pytest
 import torch
 
 from src import _boolcsr as bc, coloring as cl
-from src.evaluate import VerificationError, jacobian
+from src.evaluate import VerificationError, VerificationInconclusive, jacobian
 from src.trace import sparsity
 
 F64 = torch.float64
@@ -316,7 +318,9 @@ class TestLowPrecisionDtypes:
         x = torch.linspace(-1, 1, 12, dtype=dt)
         P = sparsity(band, x)
         c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
-        J = jacobian(band, x, coloring=c)  # raises if the tolerance is too tight
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", VerificationInconclusive)
+            J = jacobian(band, x, coloring=c)  # raises if the tolerance is too tight
         tol = 8 * float(torch.finfo(dt).eps)
         want = dense_jac(band, x).to(F64)
         torch.testing.assert_close(J.to_dense().to(F64), want,
@@ -325,4 +329,60 @@ class TestLowPrecisionDtypes:
     @pytest.mark.parametrize("dt", LOW, ids=LOW_IDS)
     def test_softmax_is_accepted_too(self, dt):
         f = lambda z: torch.softmax(z.reshape(2, 6), dim=1).reshape(-1)
-        jacobian(f, torch.linspace(-1, 1, 12, dtype=dt))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", VerificationInconclusive)
+            jacobian(f, torch.linspace(-1, 1, 12, dtype=dt))
+
+
+class TestVerificationOutcomes:
+    """Agreeing inside a rounding allowance the size of the answer proves nothing."""
+
+    # bfloat16 leaves room of about 0.55 of the terms summed, float16 about 0.07.
+    @pytest.mark.parametrize("dt,expect", [
+        (F64, False), (torch.float32, False), (torch.float16, False),
+        (torch.bfloat16, True),
+    ], ids=["float64", "float32", "float16", "bfloat16"])
+    def test_only_the_coarsest_dtype_is_inconclusive(self, dt, expect):
+        x = torch.linspace(-1, 1, 12, dtype=dt)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            jacobian(band, x)
+        got = any(isinstance(m.message, VerificationInconclusive) for m in w)
+        assert got is expect
+
+    def test_a_non_finite_derivative_is_inconclusive_not_a_pass(self):
+        # sqrt has an infinite derivative at zero. Infinities cannot be compared
+        # against a rounding allowance, so this must not be reported as a pass.
+        x = torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=F64)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            J = jacobian(torch.sqrt, x)
+        assert any(isinstance(m.message, VerificationInconclusive) for m in w)
+        assert J._nnz() == 4  # the result is still returned, just unchecked
+
+    def test_a_non_finite_input_with_a_finite_derivative_still_checks(self):
+        # A nan in the input is not the trigger. z * 2 has a constant derivative,
+        # so the comparison runs and means something.
+        x = torch.tensor([float("nan"), 1.0, 2.0, 3.0], dtype=F64)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            jacobian(lambda z: z * 2.0, x)
+        assert not any(isinstance(m.message, VerificationInconclusive) for m in w)
+
+    def test_an_inconclusive_check_still_reports_a_real_disagreement(self):
+        # A stale coloring in bfloat16 is wrong by far more than the rounding
+        # allowance, so it is caught rather than excused.
+        class Slicer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.start = 0
+
+            def forward(self, z):
+                return z[self.start:self.start + 2]
+
+        m = Slicer()
+        x = torch.linspace(-1, 1, 4, dtype=torch.bfloat16)
+        c = cl.color_cols(sparsity(m, x))
+        m.start = 1
+        with pytest.raises(VerificationError):
+            jacobian(m, x, coloring=c)

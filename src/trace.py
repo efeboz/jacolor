@@ -16,7 +16,8 @@ import torch
 from . import _boolcsr as bc
 from . import propagate as pr
 
-__all__ = ["sparsity", "UnsupportedOp", "CustomBackward", "TraceMismatch"]
+__all__ = ["sparsity", "supported_ops", "UnsupportedOp", "CustomBackward",
+           "TraceMismatch"]
 
 aten = torch.ops.aten
 
@@ -69,7 +70,9 @@ def _pointwise(node, args, kwargs, pats, out):
     return pr.pointwise(tuple(out.shape), terms)
 
 
-def _sum(node, args, kwargs, pats, out):
+def _reduce(node, args, kwargs, pats, out):
+    # sum and mean share an incidence. Both have a nonzero derivative for every
+    # element of the slice, 1 and 1/n, so both are exact.
     x = args[0]
     # An empty dim list means every dim, as in ATen. x.sum() exports as sum(x, []).
     dims = tuple(args[1]) if len(args) > 1 and len(args[1]) else tuple(range(x.dim()))
@@ -83,6 +86,19 @@ def _softmax(node, args, kwargs, pats, out):
 def _mm(node, args, kwargs, pats, out):
     (m, k), (_, n) = args[0].shape, args[1].shape
     return pr.mm(pats[0], pats[1], m, k, n)
+
+
+def _addmm(node, args, kwargs, pats, out):
+    # bias + mat1 @ mat2, which is what nn.Linear becomes. The scale factors are
+    # values, so they are not read: a beta of zero still leaves the bias in.
+    bias, a, b = args[0], args[1], args[2]
+    (m, k), (_, n) = a.shape, b.shape
+    parts = []
+    if pats[1] is not None or pats[2] is not None:
+        parts.append(pr.mm(pats[1], pats[2], m, k, n))
+    if pats[0] is not None:
+        parts.append(pr.gather(pats[0], pr.bcast_src(tuple(bias.shape), tuple(out.shape))))
+    return pr.union(*parts)
 
 
 def _cat(node, args, kwargs, pats, out):
@@ -110,22 +126,46 @@ def _conv(node, args, kwargs, pats, out):
     return pr.union(*parts)
 
 
+# Ops whose output element is one input element moved. The row map comes from
+# running the op itself on an index tensor, so torch defines the semantics.
 _ROW_MAPS = [aten.view.default, aten.slice.Tensor, aten.permute.default, aten.expand.default,
-             aten.unsqueeze.default, aten.clone.default, aten.select.int]
+             aten.unsqueeze.default, aten.squeeze.dim, aten.squeeze.dims,
+             aten.clone.default, aten.select.int]
+# Elementwise ops. where.self belongs here because its condition is an untracked
+# operand, so the union over the tracked branches already ignores it.
 _POINTWISE = [aten.add.Tensor, aten.sub.Tensor, aten.mul.Tensor, aten.div.Tensor,
               aten.neg.default, aten.tanh.default, aten.sin.default, aten.cos.default,
-              aten.exp.default, aten.relu.default, aten.sigmoid.default]
+              aten.exp.default, aten.relu.default, aten.sigmoid.default,
+              aten.sqrt.default, aten.rsqrt.default, aten.log.default,
+              aten.reciprocal.default, aten.abs.default, aten.pow.Tensor_Scalar,
+              aten.where.self]
 
 RULES = {
     **{op: _row_map for op in _ROW_MAPS},
     **{op: _pointwise for op in _POINTWISE},
-    aten.sum.dim_IntList: _sum,
-    aten.sum.default: _sum,
+    aten.sum.dim_IntList: _reduce,
+    aten.sum.default: _reduce,
+    aten.mean.dim: _reduce,
+    aten.mean.default: _reduce,
     aten._softmax.default: _softmax,
+    aten._log_softmax.default: _softmax,
     aten.mm.default: _mm,
+    aten.addmm.default: _addmm,
     aten.cat.default: _cat,
     aten.convolution.default: _conv,
 }
+
+_KIND = {_row_map: "row map", _pointwise: "pointwise", _reduce: "reduction",
+         _softmax: "slice coupling", _mm: "coupling", _addmm: "coupling",
+         _cat: "row map", _conv: "coupling"}
+
+
+def supported_ops():
+    """Every op with a rule, as (name, kind) pairs, sorted by name.
+
+    The table in the README is checked against this, so the two cannot drift.
+    """
+    return sorted((str(op).replace("aten.", ""), _KIND[rule]) for op, rule in RULES.items())
 
 
 # --- tracing -----------------------------------------------------------------

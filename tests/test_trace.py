@@ -205,6 +205,12 @@ class TestRefusals:
             sparsity(f, torch.randn(4, dtype=F64))
         msg = str(e.value)
         assert "aten.cumsum" in msg
+        # The exact line comes from a private torch hook. Without it the message
+        # still names the op, it just cannot point at the caller.
+        import torch.fx.proxy as fxp
+
+        if not hasattr(fxp, "_STACK_TRACE_ANCHORS"):
+            pytest.skip("this torch has no stack trace anchor registry")
         assert "test_trace.py" in msg and "torch.cumsum(z, 0)" in msg
 
     def test_anchor_registry_is_left_as_found(self):
@@ -398,3 +404,101 @@ class TestDerivativeFidelity:
         f = lambda z: z if torch.compiler.is_compiling() else z + z.sum()
         with pytest.raises(TraceMismatch):
             sparsity(f, torch.randn(3, dtype=F64))
+
+
+class TestLinearCoverage:
+    """nn.Linear becomes addmm, which is what an ordinary network needs."""
+
+    def test_linear_layer(self):
+        torch.manual_seed(0)
+        lin = torch.nn.Linear(4, 3, dtype=F64)
+        f = lambda z: lin(z)
+        x = torch.randn(4, dtype=F64)
+        P = sparsity(f, x)
+        assert (P.toarray() == (dense_jac(f, x) != 0).numpy()).all()
+
+    def test_linear_without_bias(self):
+        torch.manual_seed(1)
+        lin = torch.nn.Linear(4, 3, bias=False, dtype=F64)
+        f = lambda z: lin(z)
+        x = torch.randn(4, dtype=F64)
+        assert (sparsity(f, x).toarray() == (dense_jac(f, x) != 0).numpy()).all()
+
+    def test_a_small_mlp(self):
+        torch.manual_seed(2)
+
+        class MLP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(4, 5, dtype=F64)
+                self.b = torch.nn.Linear(5, 2, dtype=F64)
+
+            def forward(self, z):
+                return self.b(torch.tanh(self.a(z.reshape(1, 4)))).reshape(-1)
+
+        m = MLP()
+        x = torch.randn(4, dtype=F64)
+        assert (sparsity(m, x).toarray() == (dense_jac(m, x) != 0).numpy()).all()
+
+    def test_matmul_against_a_constant(self):
+        A = torch.randn(4, 3, generator=torch.Generator().manual_seed(3), dtype=F64)
+        f = lambda z: z @ A
+        x = torch.randn(4, dtype=F64)
+        assert_contains(sparsity(f, x), f, x)
+
+
+# A mask built from the tracked input would be a comparison on a tracked value,
+# which has no rule and is refused. A constant mask is the supported case.
+_MASK = torch.tensor([[True, False, True, False]] * 3)
+
+NEW_OPS = [
+    ("pow and sqrt", lambda z: (z**2 + 3.0).sqrt()),
+    ("log", lambda z: torch.log(z**2 + 2.0)),
+    ("rsqrt", lambda z: torch.rsqrt(z**2 + 1.0)),
+    ("reciprocal", lambda z: torch.reciprocal(z**2 + 2.0)),
+    ("abs", lambda z: torch.abs(z) * 2.0),
+    ("mean over a dim", lambda z: z.reshape(3, 4).mean(1)),
+    ("mean over all", lambda z: z.mean().reshape(1)),
+    ("log_softmax", lambda z: torch.log_softmax(z.reshape(3, 4), 1).reshape(-1)),
+    ("where on a constant mask", lambda z: torch.where(_MASK, z.reshape(3, 4), z.reshape(3, 4) * 2).reshape(-1)),
+    ("squeeze and unsqueeze", lambda z: z.reshape(3, 4).unsqueeze(0).squeeze(0).reshape(-1)),
+    ("transpose then flatten", lambda z: z.reshape(3, 4).t().flatten()),
+]
+
+
+@pytest.mark.parametrize("name,f", NEW_OPS, ids=[n for n, _ in NEW_OPS])
+def test_new_operator_coverage(name, f):
+    x = torch.randn(12, generator=torch.Generator().manual_seed(4), dtype=F64)
+    assert_contains(sparsity(f, x), f, x)
+
+
+def test_supported_ops_is_a_sorted_table():
+    from src.trace import supported_ops
+
+    table = supported_ops()
+    assert table == sorted(table)
+    names = [n for n, _ in table]
+    assert len(names) == len(set(names))
+    assert "addmm.default" in names and "mm.default" in names
+    assert set(k for _, k in table) <= {
+        "row map", "pointwise", "reduction", "slice coupling", "coupling"
+    }
+
+
+def test_readme_table_matches_the_registry():
+    # The README promises a set of operators. It has to be the set that exists.
+    import collections
+    import pathlib
+    import re
+
+    from src.trace import supported_ops
+
+    want = collections.defaultdict(set)
+    for name, kind in supported_ops():
+        want[kind].add(name)
+    text = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+    got = collections.defaultdict(set)
+    for kind, ops in re.findall(r"^\| (row map|pointwise|reduction|slice coupling|coupling) \| (.+?) \|$",
+                                text.read_text(), re.M):
+        got[kind] |= {o.strip() for o in ops.split(",")}
+    assert dict(got) == dict(want)
