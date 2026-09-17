@@ -5,41 +5,96 @@ on:
     branches: [main]
   pull_request:
 
+# A second push supersedes the first rather than queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  tests:
+    name: python ${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # 2.6 is the floor, latest is the moving target.
         python: ["3.10", "3.11", "3.12", "3.13"]
-        torch: ["2.6.0", "latest"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+          cache: pip
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          if [ "${{ matrix.torch }}" = "latest" ]; then
-            pip install torch --index-url https://download.pytorch.org/whl/cpu
-          else
-            pip install "torch==${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
-          fi
-          pip install ".[dev,fast]"
-      - run: pytest -q
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ".[dev]"
+      - name: Test
+        # The tests import from src/, not from the installed copy. numba is left
+        # out here so a missing wheel on a new python cannot redden the matrix,
+        # and the pure-python coloring path gets exercised on every version.
+        run: pytest -q
 
-  no-numba:
-    # The pure-Python greedy fallback has to keep working on its own.
+  numba:
+    name: numba kernel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: |
+          cache: pip
+      - name: Install with the fast extra
+        run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install ".[dev]"
-      - run: pytest -q
+          pip install ".[dev,fast]"
+      - name: Check the kernel is actually jitted
+        run: python -c "from src.coloring import HAS_NUMBA; assert HAS_NUMBA, 'the fast extra did not take'"
+      - name: Test
+        run: pytest -q
+
+  wheel:
+    name: installed package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build and install the wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip wheel . --no-deps -w dist
+          pip install dist/jacolor-*.whl
+      - name: Smoke test what a user would install
+        # Run from elsewhere so src/ is not importable and this is the real
+        # installed package, which ships the modules renamed to jacolor.
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import torch
+          import jacolor
+
+          torch.set_default_dtype(torch.float64)
+
+          def f(x):
+              return torch.tanh(x[:-2] * x[1:-1]) + torch.sin(x[2:])
+
+          x = torch.randn(12)
+          truth = torch.func.jacrev(f)(x)
+
+          assert torch.allclose(jacolor.jacobian(f, x).to_dense(), truth)
+
+          p = jacolor.prepare(f, x)
+          y, J = p.value_and_jacobian(x)
+          assert torch.allclose(y, f(x))
+          assert torch.allclose(J.to_dense(), truth)
+
+          S = jacolor.to_scipy(J)
+          assert S.shape == (10, 12) and S.nnz == 30
+          assert len(jacolor.supported_ops()) > 30
+          print("ok", jacolor.__version__, p)
+          PY
