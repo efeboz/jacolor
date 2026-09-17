@@ -43,34 +43,56 @@ def _pull(back, shape, S):
     return out.reshape(k, -1)
 
 
-def _verify(f, x, ri, ci, vals, coloring):
-    # One directional derivative, from autograd and from the assembled entries.
-    # A sound pattern gives the same answer either way, so a mismatch means the
-    # structure does not belong to this function at this point.
+def _verify(f, x, ri, ci, vals, coloring, primal=None, back=None):
+    """Check the assembled entries against one directional derivative.
+
+    A sound pattern gives the same answer whether the direction goes through
+    autograd or through the entries, so a disagreement means the structure does
+    not belong to this function at this point. One point and one direction, so
+    this is evidence and not a proof.
+    """
     P = coloring.pattern
     seed = ((P.shape[0] * 1000003 + P.shape[1]) * 1000003 + P.nnz) % (2**31)
     g = torch.Generator().manual_seed(seed)
-    acc = torch.zeros(P.shape[0] if coloring.axis == "cols" else P.shape[1],
-                      dtype=vals.dtype, device=vals.device)
+    wide = torch.float64  # the check must not contribute error of its own
+    n_out = P.shape[0] if coloring.axis == "cols" else P.shape[1]
+    acc = torch.zeros(n_out, dtype=wide, device=vals.device)
+    mag = torch.zeros(n_out, dtype=wide, device=vals.device)
+    cnt = torch.zeros(n_out, dtype=wide, device=vals.device)
+
     if coloring.axis == "cols":
-        v = torch.randn(P.shape[1], generator=g, dtype=x.dtype).to(x.device)
+        v = torch.randn(P.shape[1], generator=g).to(x.dtype).to(x.device)
         want = torch.func.jvp(f, (x,), (v.reshape(x.shape),))[1].reshape(-1)
-        acc.index_add_(0, ri, vals * v[ci].to(vals.dtype))
+        at, term = ri, vals.to(wide) * v[ci].to(wide)
     else:
-        y, back = torch.func.vjp(f, x)
-        w = torch.randn(P.shape[0], generator=g, dtype=y.dtype).to(x.device)
-        want = back(w.reshape(y.shape))[0].reshape(-1)
-        acc.index_add_(0, ci, vals * w[ri].to(vals.dtype))
-    scale = float(want.abs().max()) if want.numel() else 0.0
-    tol = 1e-3 if want.dtype in (torch.float16, torch.float32) else 1e-6
-    if not torch.allclose(acc, want.to(acc.dtype), rtol=tol, atol=tol * max(scale, 1.0)):
-        off = int((acc - want.to(acc.dtype)).abs().argmax())
+        if back is None:  # reuse the caller's closure rather than run f again
+            primal, back = torch.func.vjp(f, x)
+        w = torch.randn(P.shape[0], generator=g).to(primal.dtype).to(x.device)
+        want = back(w.reshape(primal.shape))[0].reshape(-1)
+        at, term = ci, vals.to(wide) * w[ri].to(wide)
+    acc.index_add_(0, at, term)
+    mag.index_add_(0, at, term.abs())
+    cnt.index_add_(0, at, torch.ones_like(term))
+    want = want.to(wide)
+
+    # Rounding room follows the size of the terms that were added and the number
+    # of them, not an absolute floor. A Jacobian scaled down by 1e-8 stays just
+    # as checkable, and a low-precision dtype is not held to float64 accuracy.
+    eps = max(_eps(vals.dtype), _eps(want.dtype))
+    room = eps * (32.0 + cnt) * (want.abs() + mag)
+    off = (acc - want).abs()
+    if bool((off > room).any()):
+        i = int((off - room).argmax())
         raise VerificationError(
             "the assembled Jacobian disagrees with autograd on f. The pattern does "
             "not describe this function at this point, which happens when a reused "
-            f"coloring is stale. Largest disagreement at entry {off}: "
-            f"{float(acc[off])} against {float(want[off])}."
+            f"coloring is stale. Worst entry {i}: {float(acc[i])} against "
+            f"{float(want[i])}, allowing {float(room[i])}."
         )
+
+
+def _eps(dtype):
+    return float(torch.finfo(dtype).eps) if dtype.is_floating_point else 2.0**-52
 
 
 def jacobian(f, x, coloring=None, chunk=None, verify=True):
@@ -104,13 +126,14 @@ def jacobian(f, x, coloring=None, chunk=None, verify=True):
 
     ri, ci, line = _index(P, coloring, x.device)
     vals = torch.empty(P.nnz, dtype=x.dtype, device=x.device)
-    back = shape = None
+    back = shape = primal = None
     if coloring.axis == "rows" and coloring.n_colors:
-        y, back = torch.func.vjp(f, x)  # built once, reused by every chunk
-        shape = y.shape
-        if y.numel() != P.shape[0]:
+        primal, back = torch.func.vjp(f, x)  # built once, reused by every chunk
+        shape = primal.shape
+        if primal.numel() != P.shape[0]:
             raise ValueError(
-                f"the coloring is for an output of {P.shape[0]} elements, got {y.numel()}"
+                f"the coloring is for an output of {P.shape[0]} elements, "
+                f"got {primal.numel()}"
             )
 
     step = chunk or max(coloring.n_colors, 1)  # a zero-color problem has no blocks
@@ -132,6 +155,8 @@ def jacobian(f, x, coloring=None, chunk=None, verify=True):
         vals[keep] = B[ri[keep], line[keep] - lo] if coloring.axis == "cols" \
             else B[line[keep] - lo, ci[keep]]
 
-    if verify and P.nnz:
-        _verify(f, x, ri, ci, vals, coloring)
+    # An empty pattern claims every derivative is zero, which is as strong a
+    # claim as any and just as worth checking.
+    if verify:
+        _verify(f, x, ri, ci, vals, coloring, primal, back)
     return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()

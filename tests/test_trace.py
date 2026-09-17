@@ -360,3 +360,41 @@ class TestTraceFidelity:
     ])
     def test_no_false_positives_on_ordinary_code(self, name, f, x):
         assert sparsity(f, x).nnz > 0
+
+
+class TestDetectionContexts:
+    """Detection has to hold in the ambient contexts a caller might be in."""
+
+    def test_custom_backward_is_caught_under_no_grad(self):
+        # An ambient no_grad leaves no autograd graph to inspect unless the
+        # inspection turns recording back on for itself.
+        with torch.no_grad():
+            with pytest.raises(CustomBackward, match="Cached"):
+                sparsity(lambda z: CACHED_APPLY(z), torch.randn(4, dtype=F64))
+
+    def test_ordinary_tracing_works_under_no_grad(self):
+        with torch.no_grad():
+            assert sparsity(band, torch.randn(12, dtype=F64)).nnz == 30
+
+    def test_custom_backward_is_caught_under_inference_mode(self):
+        with torch.inference_mode():
+            with pytest.raises(CustomBackward, match="Cached"):
+                sparsity(lambda z: CACHED_APPLY(z), torch.randn(4, dtype=F64))
+
+
+class TestDerivativeFidelity:
+    """Equal values at a point do not make two programs the same function."""
+
+    def test_values_can_agree_while_derivatives_differ(self):
+        # x.sum() is zero here, so eager and traced return identical values. The
+        # pattern comes from the derivative, and the derivatives differ.
+        f = lambda z: z if torch.compiler.is_compiling() else z + z.sum()
+        x = torch.tensor([1.0, -1.0, 0.0], dtype=F64)
+        assert torch.equal(f(x), x)  # a value-only check would pass here
+        with pytest.raises(TraceMismatch):
+            sparsity(f, x)
+
+    def test_the_value_check_still_catches_its_own_case(self):
+        f = lambda z: z if torch.compiler.is_compiling() else z + z.sum()
+        with pytest.raises(TraceMismatch):
+            sparsity(f, torch.randn(3, dtype=F64))

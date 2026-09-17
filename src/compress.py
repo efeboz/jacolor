@@ -22,7 +22,7 @@ def _block(coloring, lo, hi, dtype, device):
     # Seed columns for colors lo up to hi, as (n_lines, hi - lo). Lines whose
     # color falls outside the range contribute nothing to this block.
     n = coloring.colors.size
-    kc = torch.as_tensor(coloring.colors).to(device)
+    kc = torch.tensor(coloring.colors).to(device)
     keep = (kc >= lo) & (kc < hi)
     S = torch.zeros(n, hi - lo, dtype=dtype, device=device)
     S[torch.arange(n, device=device)[keep], kc[keep] - lo] = 1
@@ -33,7 +33,7 @@ def _index(P, coloring, device):
     # Row, column and owning color of every pattern nonzero, in CSR order.
     ri = torch.from_numpy(np.repeat(np.arange(P.shape[0]), bc.row_nnz(P))).to(device)
     ci = torch.from_numpy(P.indices.astype(np.int64)).to(device)
-    kc = torch.as_tensor(coloring.colors).to(device)
+    kc = torch.tensor(coloring.colors).to(device)
     return ri, ci, (kc[ci] if coloring.axis == "cols" else kc[ri])
 
 

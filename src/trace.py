@@ -160,8 +160,9 @@ def _eager(f, x):
     # takes part in the derivative leaves a BackwardCFunction node in the graph,
     # which is visible however apply was reached, including an apply captured
     # into a local name before tracing.
-    xr = x.detach().clone().requires_grad_(True)
-    y = f(xr)
+    with torch.enable_grad():  # an ambient no_grad would leave nothing to inspect
+        xr = x.detach().clone().requires_grad_(True)
+        y = f(xr)
     seen, stack, found = set(), [getattr(y, "grad_fn", None)], set()
     while stack:
         node = stack.pop()
@@ -250,11 +251,28 @@ def _walk(ep, x):
     return P, val[res]
 
 
+def _same_derivative(f, traced, x):
+    # Reverse mode, because its operator coverage is the wider of the two. One
+    # direction at one point, so this is evidence rather than proof.
+    g = torch.Generator().manual_seed(1 + x.numel())
+    with torch.enable_grad():
+        y, back = torch.func.vjp(f, x)
+        w = torch.randn(y.shape, generator=g).to(y.dtype).to(x.device)
+        want = back(w)[0]
+        got = torch.func.vjp(traced, x)[1](w)[0]
+    return torch.allclose(got, want, rtol=1e-6, atol=1e-9, equal_nan=True)
+
+
 def sparsity(f, x):
     """Jacobian sparsity pattern of f at x, as bool CSR of shape (f(x).numel(), x.numel()).
 
     Holds for every input of x's shape on which f takes the same path through its
     code. Control flow on the values of x is outside that, and export refuses it.
+
+    Two things are checked against f itself at x: that the traced program returns
+    the same values, and that it has the same derivative in one random direction.
+    Both are samples, so they are evidence that the trace stands for f rather than
+    a guarantee of it.
     """
     y, custom = _eager(f, x)
     if custom:
@@ -270,10 +288,16 @@ def sparsity(f, x):
     # other than f. A pattern taken from it would then describe the wrong function.
     same = traced.shape == y.shape and torch.allclose(traced, y, rtol=1e-9, atol=1e-12,
                                                       equal_nan=True)
+    if same:
+        # Equal values are not enough. The two programs can agree at a point and
+        # still have different derivatives, which is the only thing the pattern
+        # is about, so compare a directional derivative as well.
+        same = _same_derivative(f, ep.module(), x)
     if not same:
         raise TraceMismatch(
             "the traced program does not agree with f on the example input, so the "
             "pattern would describe a different function. This happens when export "
-            "specializes a branch, as with torch.compiler.is_compiling()."
+            "specializes a branch, as with torch.compiler.is_compiling(), and when f "
+            "is not deterministic."
         )
     return P

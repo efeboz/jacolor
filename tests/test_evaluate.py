@@ -247,3 +247,82 @@ class TestEvaluationCost:
         calls["n"] = 0
         jacobian(f, x, coloring=c, chunk=1, verify=False)
         assert calls["n"] == 1
+
+
+class TestEmptyPatternIsStillChecked:
+    """An empty pattern claims every derivative is zero, which is a real claim."""
+
+    @pytest.mark.parametrize("axis", ["cols", "rows"])
+    def test_a_constant_coloring_reused_for_the_identity_is_caught(self, axis):
+        const = lambda z: torch.zeros(3, dtype=F64)
+        x = torch.randn(3, generator=torch.Generator().manual_seed(20), dtype=F64)
+        P = sparsity(const, x)
+        assert P.nnz == 0
+        c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
+        with pytest.raises(VerificationError):
+            jacobian(lambda z: z, x, coloring=c)
+
+    def test_a_genuinely_constant_function_still_passes(self):
+        const = lambda z: torch.zeros(3, dtype=F64)
+        x = torch.randn(3, generator=torch.Generator().manual_seed(21), dtype=F64)
+        assert jacobian(const, x)._nnz() == 0
+
+
+class Scaled(torch.nn.Module):
+    """Slices two elements and scales them, so the derivative size is a knob."""
+
+    def __init__(self, k, start=0):
+        super().__init__()
+        self.k = k
+        self.start = start
+
+    def forward(self, z):
+        return z[self.start:self.start + 2] * self.k
+
+
+SCALES = [(1.0, F64), (1e-8, F64), (1e8, F64), (1e-4, torch.float32), (1e4, torch.float32)]
+SCALE_IDS = [f"{k:g}-{str(d).split('.')[-1]}" for k, d in SCALES]
+
+
+class TestVerificationAcrossScales:
+    """Tolerance has to follow the size of the derivative, not sit at a floor."""
+
+    @pytest.mark.parametrize("k,dt", SCALES, ids=SCALE_IDS)
+    def test_a_stale_coloring_is_caught_at_any_scale(self, k, dt):
+        m = Scaled(k)
+        x = torch.randn(4, generator=torch.Generator().manual_seed(22), dtype=dt)
+        c = cl.color_cols(sparsity(m, x))
+        m.start = 1
+        with pytest.raises(VerificationError):
+            jacobian(m, x, coloring=c)
+
+    @pytest.mark.parametrize("k,dt", SCALES, ids=SCALE_IDS)
+    def test_the_same_problem_passes_when_it_is_valid(self, k, dt):
+        m = Scaled(k)
+        x = torch.randn(4, generator=torch.Generator().manual_seed(23), dtype=dt)
+        assert jacobian(m, x)._nnz() == 2
+
+
+LOW = [torch.bfloat16, torch.float16, torch.float32, F64]
+LOW_IDS = [str(d).split(".")[-1] for d in LOW]
+
+
+class TestLowPrecisionDtypes:
+    """Tolerance follows dtype precision, so a correct cheap result is accepted."""
+
+    @pytest.mark.parametrize("axis", ["cols", "rows"])
+    @pytest.mark.parametrize("dt", LOW, ids=LOW_IDS)
+    def test_verification_accepts_a_correct_result(self, dt, axis):
+        x = torch.linspace(-1, 1, 12, dtype=dt)
+        P = sparsity(band, x)
+        c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
+        J = jacobian(band, x, coloring=c)  # raises if the tolerance is too tight
+        tol = 8 * float(torch.finfo(dt).eps)
+        want = dense_jac(band, x).to(F64)
+        torch.testing.assert_close(J.to_dense().to(F64), want,
+                                   rtol=tol, atol=tol * float(want.abs().max()))
+
+    @pytest.mark.parametrize("dt", LOW, ids=LOW_IDS)
+    def test_softmax_is_accepted_too(self, dt):
+        f = lambda z: torch.softmax(z.reshape(2, 6), dim=1).reshape(-1)
+        jacobian(f, torch.linspace(-1, 1, 12, dtype=dt))

@@ -190,6 +190,12 @@ class TestColoringFitsItsPattern:
         labels[:] = 0
         assert c.colors.tolist() == [0, 1]
 
+    def test_the_stored_labels_cannot_be_edited(self):
+        # Validation happens once, so the validated state has to stay put.
+        c = cl.Coloring(np.array([0, 1]), 2, 1, "natural", "cols", bc.eye(2))
+        with pytest.raises(ValueError, match="read-only"):
+            c.colors[0] = 1
+
     def test_pattern_is_copied(self):
         # Editing the caller's matrix afterwards must not move the pattern the
         # coloring decompresses onto.

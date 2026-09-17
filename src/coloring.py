@@ -70,7 +70,9 @@ class Coloring:
         if _conflict(L, colors):
             other = "row" if axis == "cols" else "column"
             raise ValueError(f"coloring is invalid: two {axis} sharing a {other} have one color")
-        self.colors = colors.copy()  # color index per column (or row), shape (n,)
+        colors = colors.copy()  # the caller keeps their own array
+        colors.flags.writeable = False  # and cannot edit past the checks above
+        self.colors = colors  # color index per column (or row), shape (n,)
         self.n_colors = n_colors
         self.lower_bound = lower_bound  # densest line of P: no coloring beats it
         self.order = order  # ordering that produced this result

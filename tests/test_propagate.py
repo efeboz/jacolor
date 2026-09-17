@@ -695,6 +695,14 @@ class TestDegenerateShapes:
         want = torch.zeros(shape).index_select(dim, torch.zeros(n_out, dtype=torch.long)).numel()
         assert pr.index_couple(empty_rows(numel(shape)), shape, dim, n_out).shape[0] == want
 
+    def test_index_couple_on_a_scalar(self):
+        # A scalar has one line along its only axis, so every output draws on it.
+        P = pr.index_couple(bc.eye(1), (), 0, 3)
+        assert P.shape == (3, 1) and P.toarray().all()
+
+    def test_slice_couple_on_a_scalar(self):
+        assert pr.slice_couple(bc.eye(1), (), (0,)).shape == (1, 1)
+
     def test_scalar_sum_is_sound(self):
         f = lambda x: x.reshape(()).sum(0).reshape(1)
         assert_sound(pr.reduce_sum(bc.eye(1), (), (0,)), f, 1)

@@ -203,6 +203,8 @@ def index_couple(P, shape, dim, n_out):
     the whole input slice along dim. The index itself is integer and carries no
     derivative, so it contributes nothing. Conservative.
     """
+    if len(shape) == 0:  # a scalar has one line along its only axis
+        return gather(reduce_sum(P, shape, (0,)), np.zeros(n_out, dtype=np.int64))
     dim %= len(shape)
     out_shape = tuple(shape[:dim]) + (n_out,) + tuple(shape[dim + 1:])
     # Input and output agree on every axis but dim, so they share slice ids.
