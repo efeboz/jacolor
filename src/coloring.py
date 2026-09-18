@@ -15,7 +15,8 @@ import numpy as np
 
 from . import _boolcsr as bc
 
-__all__ = ["Coloring", "color_cols", "color_rows", "ORDERS"]
+__all__ = ["Coloring", "color_cols", "color_rows", "graph_estimate", "MAX_EDGES",
+           "ORDERS"]
 
 # Orderings tried by default. The one giving the fewest colors wins.
 ORDERS = ("natural", "lf", "sl")
@@ -25,7 +26,18 @@ _SLOW_ABOVE = 10_000
 
 # Refuse to build a column-intersection graph larger than this. At roughly 9
 # bytes an entry that is about 1.8 GB. Measured patterns sit near a million.
-_MAX_EDGES = 200_000_000
+MAX_EDGES = 200_000_000
+
+
+def graph_estimate(P):
+    """Entries the column-intersection graph of P could hold, at most.
+
+    A row with k entries contributes at most k squared pairs, and the graph
+    cannot hold more than one entry per ordered pair of columns. Cheap enough to
+    ask before building anything, which is what lets a caller pick a direction.
+    """
+    rn = bc.row_nnz(bc.check(P)).astype(np.int64)
+    return min(int((rn * rn).sum()), P.shape[1] ** 2)
 
 
 def _conflict(L, colors):
@@ -166,14 +178,9 @@ def _best(P, orders):
             "Install jacolor[fast] for the numba kernel",
             stacklevel=3,
         )
-    # A row with k nonzeros contributes at most k * k pairs to A, so the cost is
-    # known before the product is built. The bound is loose where columns share
-    # many rows, which is exactly where the product is cheap anyway.
     rn = bc.row_nnz(P).astype(np.int64)
-    # The graph cannot hold more than one entry per ordered pair of columns, so
-    # the pair count is only a bound while the columns outnumber the pairs.
-    edges = min(int((rn * rn).sum()), n * n)
-    if edges > _MAX_EDGES:
+    edges = graph_estimate(P)
+    if edges > MAX_EDGES:
         raise MemoryError(
             f"the column-intersection graph could hold up to {edges} entries, about "
             f"{edges * 9 / 1e9:.1f} GB. The densest row has {int(rn.max())} nonzeros, "
@@ -189,6 +196,8 @@ def _best(P, orders):
         k = int(colors.max()) + 1 if n else 0
         if best is None or k < best[1]:
             best = (colors, k, lb, name)
+        if best[1] <= lb:  # the bound is reached, so no ordering can do better
+            break
     return best
 
 

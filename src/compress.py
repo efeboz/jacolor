@@ -18,12 +18,20 @@ from . import _boolcsr as bc
 __all__ = ["seeds", "decompress"]
 
 
-def _block(coloring, lo, hi, dtype, device):
+def _block(coloring, lo, hi, dtype, device, lines=None):
     # Seed columns for colors lo up to hi, as (n_lines, hi - lo). Lines whose
     # color falls outside the range contribute nothing to this block.
+    #
+    # lines restricts which lines may be seeded at all. A line left out of a
+    # pattern is not a line without a derivative, so seeding it would fold that
+    # derivative into the compressed result. Only a split pattern needs this.
     n = coloring.colors.size
     kc = torch.tensor(coloring.colors).to(device)
     keep = (kc >= lo) & (kc < hi)
+    if lines is not None:
+        inside = torch.zeros(n, dtype=torch.bool, device=device)
+        inside[torch.as_tensor(np.asarray(lines), dtype=torch.long).to(device)] = True
+        keep = keep & inside
     S = torch.zeros(n, hi - lo, dtype=dtype, device=device)
     S[torch.arange(n, device=device)[keep], kc[keep] - lo] = 1
     return S

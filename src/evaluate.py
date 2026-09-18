@@ -59,7 +59,7 @@ def _pull(back, shape, S):
     return out.reshape(k, -1)
 
 
-def _verify(f, x, ri, ci, vals, coloring, primal=None, back=None):
+def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None):
     """Check the assembled entries against one directional derivative.
 
     A sound pattern gives the same answer whether the direction goes through
@@ -70,16 +70,15 @@ def _verify(f, x, ri, ci, vals, coloring, primal=None, back=None):
     Returns "ok" when the comparison could resolve the terms it was summing, and
     "inconclusive" when rounding or a non-finite value left it unable to tell.
     """
-    P = coloring.pattern
     seed = ((P.shape[0] * 1000003 + P.shape[1]) * 1000003 + P.nnz) % (2**31)
     g = torch.Generator().manual_seed(seed)
     wide = torch.float64  # the check must not contribute error of its own
-    n_out = P.shape[0] if coloring.axis == "cols" else P.shape[1]
+    n_out = P.shape[0] if axis == "cols" else P.shape[1]
     acc = torch.zeros(n_out, dtype=wide, device=vals.device)
     mag = torch.zeros(n_out, dtype=wide, device=vals.device)
     cnt = torch.zeros(n_out, dtype=wide, device=vals.device)
 
-    if coloring.axis == "cols":
+    if axis == "cols":
         v = torch.randn(P.shape[1], generator=g).to(x.dtype).to(x.device)
         want = torch.func.jvp(f, (x,), (v.reshape(x.shape),))[1].reshape(-1)
         at, term = ri, vals.to(wide) * v[ci].to(wide)
@@ -97,8 +96,11 @@ def _verify(f, x, ri, ci, vals, coloring, primal=None, back=None):
     # Rounding room follows the size of the terms that were added and the number
     # of them, not an absolute floor. A Jacobian scaled down by 1e-8 stays just
     # as checkable, and a low-precision dtype is not held to float64 accuracy.
-    eps = max(_eps(vals.dtype), _eps(want.dtype))
-    room = eps * (32.0 + cnt) * (want.abs() + mag)
+    # Casting the oracle to float64 does not make the arithmetic behind it
+    # float64, so the input's precision counts as much as the result's.
+    eps = max(_eps(vals.dtype), _eps(want.dtype), _eps(x.dtype))
+    scale = want.abs() + mag
+    room = eps * (32.0 + cnt) * scale
     off = (acc - want).abs()
 
     if not (bool(torch.isfinite(want).all()) and bool(torch.isfinite(acc).all())):
@@ -115,11 +117,13 @@ def _verify(f, x, ri, ci, vals, coloring, primal=None, back=None):
             f"coloring is stale. Worst entry {i}: {float(acc[i])} against "
             f"{float(want[i])}, allowing {float(room[i])}."
         )
-    # Agreeing inside a rounding allowance as large as the terms themselves says
-    # nothing, so it is reported as such rather than as a pass.
-    live = mag > 0
-    if bool((live & (room > _RESOLVE * mag)).any()):
-        worst = float((room[live] / mag[live]).max()) if bool(live.any()) else 0.0
+    # Agreeing inside a rounding allowance as large as the answer says nothing.
+    # The scale has to include the answer, not only the terms that were summed:
+    # cancellation leaves no terms at all, and gating on those would let a
+    # pattern that reconstructs exactly zero pass against a nonzero truth.
+    live = scale > 0
+    if bool((live & (room > _RESOLVE * scale)).any()):
+        worst = float((room[live] / scale[live]).max()) if bool(live.any()) else 0.0
         warnings.warn(VerificationInconclusive(
             f"verification allowed rounding of up to {worst:.2f} of the terms it "
             f"summed, in {vals.dtype}, so agreement does not rule out a wrong "
@@ -151,6 +155,16 @@ def _assemble(f, x, coloring, chunk, verify, index=None):
                 f"got {primal.numel()}"
             )
 
+    if coloring.n_colors == 0:
+        # No block ever runs, so the checks inside the loop never happen. The
+        # output still has to be the size the pattern was built for.
+        primal = f(x)
+        if primal.numel() != P.shape[0]:
+            raise ValueError(
+                f"the coloring is for an output of {P.shape[0]} elements, "
+                f"got {primal.numel()}"
+            )
+
     step = chunk or max(coloring.n_colors, 1)  # a zero-color problem has no blocks
     for lo in range(0, coloring.n_colors, step):
         hi = min(lo + step, coloring.n_colors)
@@ -172,7 +186,7 @@ def _assemble(f, x, coloring, chunk, verify, index=None):
 
     # An empty pattern claims every derivative is zero, which is as strong a
     # claim as any and just as worth checking.
-    status = _verify(f, x, ri, ci, vals, coloring, primal, back) if verify else "skipped"
+    status = _verify(f, x, ri, ci, vals, P, coloring.axis, primal, back) if verify else "skipped"
     J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
     return J, primal, status
 

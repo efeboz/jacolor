@@ -24,7 +24,8 @@ def pattern(obj):
     if sp.issparse(obj):
         return bc.check(sp.csr_array(obj.astype(bool)))
     if isinstance(obj, torch.Tensor):
-        obj = obj.detach().cpu().numpy()
+        # Compare in torch and hand numpy a bool array. numpy has no bfloat16.
+        return bc.from_dense((obj != 0).detach().cpu().numpy())
     return bc.from_dense(np.asarray(obj) != 0)
 
 
@@ -36,15 +37,27 @@ def pattern_from_pairs(rows, cols, shape):
     return bc.from_pairs(rows, cols, shape)
 
 
+# What scipy.sparse will hold. float16 and bfloat16 are not among them.
+_SCIPY_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128,
+                 torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8,
+                 torch.bool)
+
+
 def to_scipy(J):
     """A sparse Jacobian as a scipy CSR matrix.
 
     The data is copied to the CPU and detached, because scipy holds plain numpy
     arrays. Nothing about autograd survives the trip.
+
+    scipy has no half precision, so a float16 or bfloat16 Jacobian is promoted to
+    float32. That widens the type without changing a value.
     """
     if not J.is_sparse:
         raise TypeError(f"expected a sparse Jacobian, got a {J.layout} tensor")
     J = J if J.is_coalesced() else J.coalesce()
+    vals = J.values()
+    if vals.dtype not in _SCIPY_DTYPES:
+        vals = vals.to(torch.float32)
     idx = J.indices().detach().cpu().numpy()
-    val = J.values().detach().cpu().numpy()
-    return sp.csr_array((val, (idx[0], idx[1])), shape=tuple(J.shape))
+    return sp.csr_array((vals.detach().cpu().numpy(), (idx[0], idx[1])),
+                        shape=tuple(J.shape))
