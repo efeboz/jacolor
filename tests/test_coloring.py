@@ -114,3 +114,59 @@ class TestAgainstNetworkx:
             P = rand_pattern(rng, m, n, rng.uniform(0.05, 0.5))
             ref = len(set(nx.greedy_color(self.graph(P), strategy="largest_first").values()))
             assert cl.color_cols(P).n_colors <= ref
+
+
+class TestGraphEstimate:
+    """The cost of a direction is knowable before anything is built."""
+
+    def test_it_bounds_the_real_graph(self):
+        rng = np.random.default_rng(0)
+        for _ in range(20):
+            m, n = rng.integers(2, 12, size=2)
+            P = rand_pattern(rng, m, n, rng.uniform(0.1, 0.8))
+            actual = bc.matmul(bc.transpose(P), P).nnz
+            assert cl.graph_estimate(P) >= actual
+
+    def test_it_is_clamped_by_the_column_count(self):
+        # 20001 rows of 100 entries bound the pairs at 2e8, but the graph cannot
+        # hold more than 100 by 100 entries.
+        P = bc.from_dense(np.ones((20001, 100), dtype=bool))
+        assert cl.graph_estimate(P) == 100 * 100
+
+    def test_a_dense_row_is_exactly_its_square(self):
+        P = bc.from_pairs(np.zeros(50, dtype=np.int64), np.arange(50), (1, 50))
+        assert cl.graph_estimate(P) == 50 * 50
+
+
+class TestStopsAtTheBound:
+    """Trying more orderings after reaching the bound cannot improve anything."""
+
+    def _count_greedy(self, monkeypatch):
+        calls = []
+        real = cl._greedy
+        monkeypatch.setattr(cl, "_greedy", lambda *a: (calls.append(1), real(*a))[1])
+        return calls
+
+    def test_one_ordering_when_the_bound_is_reached(self, monkeypatch):
+        calls = self._count_greedy(monkeypatch)
+        P = bc.from_dense(np.eye(8, dtype=bool))
+        c = cl.color_cols(P)
+        assert c.n_colors == c.lower_bound == 1
+        assert len(calls) == 1
+
+    def test_every_ordering_when_it_is_not(self, monkeypatch):
+        calls = self._count_greedy(monkeypatch)
+        # A three cycle needs three colors although its densest line holds two.
+        P = bc.from_dense(np.array([[1, 1, 0], [0, 1, 1], [1, 0, 1]], dtype=bool))
+        c = cl.color_cols(P)
+        assert c.n_colors == 3 and c.lower_bound == 2
+        assert len(calls) == len(cl.ORDERS)
+
+    def test_stopping_early_never_costs_a_color(self):
+        # Whatever it stops at must still be the best any single ordering gives.
+        rng = np.random.default_rng(1)
+        for _ in range(40):
+            m, n = rng.integers(2, 14, size=2)
+            P = rand_pattern(rng, m, n, rng.uniform(0.1, 0.6))
+            each = [cl.color_cols(P, orders=(o,)).n_colors for o in cl.ORDERS]
+            assert cl.color_cols(P).n_colors == min(each)

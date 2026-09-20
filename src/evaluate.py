@@ -19,7 +19,7 @@ import torch
 
 from .coloring import color_cols
 from .compress import _block, _index
-from .trace import sparsity
+from .trace import _real, sparsity
 
 __all__ = ["jacobian", "VerificationError", "VerificationInconclusive"]
 
@@ -59,13 +59,16 @@ def _pull(back, shape, S):
     return out.reshape(k, -1)
 
 
-def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None):
+def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None, floor=None):
     """Check the assembled entries against one directional derivative.
 
     A sound pattern gives the same answer whether the direction goes through
     autograd or through the entries, so a disagreement means the structure does
     not belong to this function at this point. One point and one direction, so
     agreement is evidence and not a proof.
+
+    floor is the coarsest precision f computes in, when that is lower than its
+    input and output show.
 
     Returns "ok" when the comparison could resolve the terms it was summing, and
     "inconclusive" when rounding or a non-finite value left it unable to tell.
@@ -97,13 +100,17 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None):
     # of them, not an absolute floor. A Jacobian scaled down by 1e-8 stays just
     # as checkable, and a low-precision dtype is not held to float64 accuracy.
     # Casting the oracle to float64 does not make the arithmetic behind it
-    # float64, so the input's precision counts as much as the result's.
-    eps = max(_eps(vals.dtype), _eps(want.dtype), _eps(x.dtype))
+    # float64, so the input's precision counts as much as the result's, and so
+    # does any lower one f declares it uses inside.
+    eps = max(_eps(vals.dtype), _eps(want.dtype), _eps(x.dtype),
+              _eps(floor) if floor is not None else 0.0)
     scale = want.abs() + mag
     room = eps * (32.0 + cnt) * scale
     off = (acc - want).abs()
 
-    if not (bool(torch.isfinite(want).all()) and bool(torch.isfinite(acc).all())):
+    # Every intermediate, not only the ends. Entries near 1e308 are finite but
+    # their sums are not, and an infinite allowance would pass anything.
+    if not all(bool(torch.isfinite(t).all()) for t in (want, acc, mag, room, off)):
         warnings.warn(VerificationInconclusive(
             "verification saw a non-finite value, so it could not compare the "
             "assembled Jacobian against autograd. The result is unchecked."
@@ -115,7 +122,9 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None):
             "the assembled Jacobian disagrees with autograd on f. The pattern does "
             "not describe this function at this point, which happens when a reused "
             f"coloring is stale. Worst entry {i}: {float(acc[i])} against "
-            f"{float(want[i])}, allowing {float(room[i])}."
+            f"{float(want[i])}, allowing {float(room[i])}. If f computes at lower "
+            "precision inside than its input and output show, pass that dtype as "
+            "verify, for instance verify=torch.float32."
         )
     # Agreeing inside a rounding allowance as large as the answer says nothing.
     # The scale has to include the answer, not only the terms that were summed:
@@ -133,6 +142,22 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None):
     return "ok"
 
 
+def _check_verify(verify):
+    if not (isinstance(verify, bool)
+            or (isinstance(verify, torch.dtype) and verify.is_floating_point)):
+        raise ValueError(f"verify must be True, False or a floating dtype, got {verify!r}")
+
+
+def _floor(verify):
+    # A dtype passed as verify means yes, and here is the coarsest precision f uses.
+    return verify if isinstance(verify, torch.dtype) else None
+
+
+def _check_chunk(chunk):
+    if chunk is not None and (not isinstance(chunk, int) or chunk < 1):
+        raise ValueError(f"chunk must be a positive whole number, got {chunk!r}")
+
+
 def _assemble(f, x, coloring, chunk, verify, index=None):
     """Run the AD passes, scatter the values, and check. Returns (J, y, status)."""
     P = coloring.pattern
@@ -140,14 +165,16 @@ def _assemble(f, x, coloring, chunk, verify, index=None):
         raise ValueError(
             f"the coloring is for an input of {P.shape[1]} elements, got {x.numel()}"
         )
-    if chunk is not None and (not isinstance(chunk, int) or chunk < 1):
-        raise ValueError(f"chunk must be a positive whole number, got {chunk!r}")
+    _check_chunk(chunk)
+    _check_verify(verify)
+    _real(x, "input")
 
     ri, ci, line = _index(P, coloring, x.device) if index is None else index
     vals = torch.empty(P.nnz, dtype=x.dtype, device=x.device)
     back = shape = primal = None
     if coloring.axis == "rows" and coloring.n_colors:
         primal, back = torch.func.vjp(f, x)  # built once, reused by every chunk
+        _real(primal, "output")  # before a pull, which fails on it less clearly
         shape = primal.shape
         if primal.numel() != P.shape[0]:
             raise ValueError(
@@ -186,7 +213,9 @@ def _assemble(f, x, coloring, chunk, verify, index=None):
 
     # An empty pattern claims every derivative is zero, which is as strong a
     # claim as any and just as worth checking.
-    status = _verify(f, x, ri, ci, vals, P, coloring.axis, primal, back) if verify else "skipped"
+    _real(primal, "output")
+    status = (_verify(f, x, ri, ci, vals, P, coloring.axis, primal, back, _floor(verify))
+              if verify else "skipped")
     J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
     return J, primal, status
 
@@ -206,7 +235,12 @@ def jacobian(f, x, coloring=None, chunk=None, verify=True):
     It costs one extra AD pass and is what catches a coloring that no longer fits
     the function. Where rounding leaves the check unable to tell, it warns
     VerificationInconclusive rather than reporting a pass. Turn it off only in a
-    loop you have already verified.
+    loop you have already verified. If f computes at lower precision inside than
+    its input and output show, pass that dtype instead, as verify=torch.float32,
+    and the tolerance allows for it.
+
+    Inputs and outputs must be real. For complex f the two AD modes give
+    conjugate answers, and this release does not pick between them.
 
     The result takes the dtype of the AD pass, which is not always the dtype of
     x. Forward mode follows f's output and reverse mode follows f's input, so a

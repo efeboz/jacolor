@@ -234,6 +234,12 @@ class TestDegenerate:
         with pytest.raises(ValueError, match="chunk must be"):
             jacobian(band, x, chunk=bad)
 
+    @pytest.mark.parametrize("bad", ["yes", 1, torch.int32])
+    def test_verify_must_be_a_bool_or_a_floating_dtype(self, bad):
+        x = torch.randn(12, generator=torch.Generator().manual_seed(13), dtype=F64)
+        with pytest.raises(ValueError, match="verify must be"):
+            jacobian(band, x, verify=bad)
+
 
 class TestEvaluationCost:
     def test_reverse_builds_the_vjp_once_per_evaluation(self):
@@ -369,6 +375,18 @@ class TestVerificationOutcomes:
             jacobian(lambda z: z * 2.0, x)
         assert not any(isinstance(m.message, VerificationInconclusive) for m in w)
 
+    def test_sums_that_overflow_are_inconclusive_not_a_pass(self):
+        # Entries of 1e307 are finite, but thirty of them summed are not. A stale
+        # pattern then gets an infinite allowance, which must not read as a pass.
+        from src.analysis import prepare
+
+        x = torch.linspace(0.5, 1.0, 40, dtype=F64)
+        p = prepare(lambda z: (1e307 * z[:30].sum()).reshape(1), x, mode="forward")
+        p.f = lambda z: (1e307 * z[:31].sum()).reshape(1)
+        with pytest.warns(VerificationInconclusive):
+            p.jacobian(x)
+        assert p.status == "inconclusive"
+
     def test_an_inconclusive_check_still_reports_a_real_disagreement(self):
         # A stale coloring in bfloat16 is wrong by far more than the rounding
         # allowance, so it is caught rather than excused.
@@ -386,3 +404,151 @@ class TestVerificationOutcomes:
         m.start = 1
         with pytest.raises(VerificationError):
             jacobian(m, x, coloring=c)
+
+
+class TestCancellationCannotHideAWrongPattern:
+    """Reconstructing exactly zero is not agreement, it is nothing to compare."""
+
+    HEAD = staticmethod(lambda z: z[:128].sum().reshape(1))
+    DIFF = staticmethod(lambda z: (z[128] - z[129]).reshape(1))
+
+    def _stale(self, dtype, mode):
+        # The pattern covers columns 0 to 127. The function it gets reused for
+        # depends on 128 and 129, so every assembled value is zero.
+        from src.analysis import prepare
+
+        x = torch.randn(256, generator=torch.Generator().manual_seed(30), dtype=dtype)
+        p = prepare(self.HEAD, x, mode=mode)
+        p.f = self.DIFF
+        return p, x
+
+    def test_bfloat16_forward_is_inconclusive_not_ok(self):
+        p, x = self._stale(torch.bfloat16, "forward")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            J = p.jacobian(x)
+        assert p.status == "inconclusive"
+        assert any(isinstance(m.message, VerificationInconclusive) for m in w)
+        assert int((J.to_dense() != 0).sum()) == 0  # and the answer really is wrong
+
+    @pytest.mark.parametrize("mode", ["forward", "reverse"])
+    def test_float64_catches_it_outright(self, mode):
+        p, x = self._stale(F64, mode)
+        with pytest.raises(VerificationError):
+            p.jacobian(x)
+
+    def test_bfloat16_reverse_still_catches_it(self):
+        # Reverse sums one term per column, so the allowance stays small enough.
+        p, x = self._stale(torch.bfloat16, "reverse")
+        with pytest.raises(VerificationError):
+            p.jacobian(x)
+
+
+class TestMixedPrecisionTolerance:
+    """The oracle's arithmetic ran at the input's precision, not the result's."""
+
+    K = torch.ones(4, dtype=F64)
+
+    @pytest.mark.parametrize("name,f", [
+        ("z*z*k", lambda z: z * z * TestMixedPrecisionTolerance.K),
+        ("z*k", lambda z: z * TestMixedPrecisionTolerance.K),
+        ("tanh(z)*k", lambda z: torch.tanh(z) * TestMixedPrecisionTolerance.K),
+    ], ids=["z*z*k", "z*k", "tanh"])
+    def test_a_correct_float32_input_is_accepted(self, name, f):
+        x = torch.randn(4, generator=torch.Generator().manual_seed(31), dtype=torch.float32)
+        J = jacobian(f, x)  # raises if the tolerance ignores the float32 arithmetic
+        torch.testing.assert_close(J.to_dense(), torch.func.jacrev(f)(x).to(F64),
+                                   rtol=1e-6, atol=1e-6)
+
+    # float64 in and out, float32 inside. Nothing at the boundary shows it.
+    LOW = staticmethod(lambda z: (torch.tanh(z.float()) * 3.0).double())
+
+    def test_hidden_float32_fails_and_says_what_to_pass(self):
+        x = torch.linspace(0.5, 1.0, 6, dtype=F64)
+        c = cl.color_cols(bc.from_dense(np.eye(6, dtype=bool)))
+        with pytest.raises(VerificationError, match="verify=torch.float32"):
+            jacobian(self.LOW, x, coloring=c)
+
+    @pytest.mark.parametrize("axis", ["cols", "rows"])
+    def test_declaring_it_is_accepted(self, axis):
+        x = torch.linspace(0.5, 1.0, 6, dtype=F64)
+        P = bc.from_dense(np.eye(6, dtype=bool))
+        c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
+        J = jacobian(self.LOW, x, coloring=c, verify=torch.float32)
+        torch.testing.assert_close(J.to_dense(), torch.func.jacrev(self.LOW)(x),
+                                   rtol=1e-6, atol=1e-6)
+
+    def test_declaring_it_still_catches_a_stale_pattern(self):
+        x = torch.linspace(0.5, 1.0, 6, dtype=F64)
+        c = cl.color_cols(bc.from_dense(np.roll(np.eye(6, dtype=bool), 1, axis=1)))
+        with pytest.raises(VerificationError):
+            jacobian(self.LOW, x, coloring=c, verify=torch.float32)
+
+    def test_a_stale_float32_pattern_is_still_caught(self):
+        # The wider allowance must not blind the check to a real disagreement.
+        from src.analysis import prepare
+
+        class Slicer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.start = 0
+
+            def forward(self, z):
+                return z[self.start:self.start + 2]
+
+        m = Slicer()
+        x = torch.randn(4, generator=torch.Generator().manual_seed(32), dtype=torch.float32)
+        p = prepare(m, x, mode="forward")
+        m.start = 1
+        with pytest.raises(VerificationError):
+            p.jacobian(x)
+
+
+class TestZeroColorOutputSize:
+    """No block runs, so the checks inside the loop never do either."""
+
+    class Const(torch.nn.Module):
+        def __init__(self, n=1):
+            super().__init__()
+            self.n = n
+
+        def forward(self, z):
+            return torch.zeros(self.n, dtype=F64)
+
+    def test_an_output_that_grows_is_caught(self):
+        from src.analysis import prepare
+
+        m = self.Const(1)
+        x = torch.zeros(0, dtype=F64)
+        p = prepare(m, x)
+        m.n = 3
+        with pytest.raises(ValueError, match="output of 1 elements, got 3"):
+            p.value_and_jacobian(x)
+
+    def test_an_unchanged_constant_still_works(self):
+        from src.analysis import prepare
+
+        x = torch.zeros(0, dtype=F64)
+        p = prepare(self.Const(1), x)
+        y, J = p.value_and_jacobian(x)
+        assert tuple(y.shape) == (1,) and tuple(J.shape) == (1, 0) and p.status == "ok"
+
+
+class TestComplexIsRefused:
+    """Forward mode gives the holomorphic derivative, reverse its conjugate."""
+
+    P = np.eye(4, dtype=bool)
+
+    @pytest.mark.parametrize("axis", ["cols", "rows"])
+    def test_complex_input(self, axis):
+        P = bc.from_dense(self.P)
+        c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
+        with pytest.raises(TypeError, match="complex input"):
+            jacobian(lambda z: z * 2, torch.ones(4, dtype=torch.complex128), coloring=c)
+
+    @pytest.mark.parametrize("axis", ["cols", "rows"])
+    def test_complex_output(self, axis):
+        P = bc.from_dense(self.P)
+        c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
+        with pytest.raises(TypeError, match="complex output"):
+            jacobian(lambda z: z * (1 + 2j), torch.ones(4, dtype=F64), coloring=c)

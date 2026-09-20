@@ -19,9 +19,6 @@ htmlcov/
 *.nbi
 *.nbc
 
-# internal, not shipped
-PLAN.md
-
 .DS_Store
 .idea/
 .vscode/

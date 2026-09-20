@@ -54,6 +54,29 @@ jobs:
       - name: Test
         run: pytest -q
 
+  floor:
+    # The declared minimums, torch 2.6 with scipy 1.14.1. Asserted, so a resolver
+    # that quietly upgrades one of them cannot turn this into a test of latest.
+    name: declared floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install the oldest supported versions
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install "scipy==1.14.1"
+          pip install ".[dev]"
+      - name: Check the floor is what got installed
+        run: |
+          python -c "import torch, scipy; assert torch.__version__.startswith('2.6.'), torch.__version__; assert scipy.__version__ == '1.14.1', scipy.__version__"
+      - name: Test
+        run: pytest -q
+
   wheel:
     name: installed package
     runs-on: ubuntu-latest
@@ -96,5 +119,15 @@ jobs:
           S = jacolor.to_scipy(J)
           assert S.shape == (10, 12) and S.nnz == 30
           assert len(jacolor.supported_ops()) > 30
-          print("ok", jacolor.__version__, p)
+
+          # One dense row and one dense column: 3 directions split, 32 either way.
+          def arrow(z):
+              return torch.cat([z.sum().reshape(1), z[0] * z[1:]])
+
+          xa = torch.randn(32)
+          h = jacolor.prepare(arrow, xa, mode="hybrid")
+          assert h.mode == "hybrid" and h.n_colors == 3, h
+          assert torch.allclose(h.jacobian(xa).to_dense(), torch.func.jacrev(arrow)(xa))
+          assert "split" in h.explain()
+          print("ok", jacolor.__version__, p, h)
           PY

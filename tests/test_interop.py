@@ -91,3 +91,34 @@ class TestToScipy:
         i = torch.tensor([[0, 0], [0, 0]])
         J = torch.sparse_coo_tensor(i, torch.tensor([1.0, 2.0]), (1, 1))
         assert to_scipy(J).toarray().tolist() == [[3.0]]
+
+
+HALF = [torch.float16, torch.bfloat16]
+HALF_IDS = [str(d).split(".")[-1] for d in HALF]
+
+
+class TestLowPrecision:
+    """numpy has no bfloat16 and scipy has no half precision at all."""
+
+    @pytest.mark.parametrize("dt", HALF, ids=HALF_IDS)
+    def test_pattern_from_a_half_precision_tensor(self, dt):
+        t = torch.tensor([[1.0, 0.0], [0.0, 2.0]], dtype=dt)
+        assert pattern(t).toarray().tolist() == [[True, False], [False, True]]
+
+    @pytest.mark.parametrize("dt", HALF, ids=HALF_IDS)
+    def test_to_scipy_promotes_half_precision(self, dt):
+        x = torch.linspace(-1, 1, 12, dtype=dt)
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            J = jacobian(band, x)
+        S = to_scipy(J)
+        assert S.dtype == np.float32 and S.nnz == 30
+        # Promotion widens the type without moving a value.
+        np.testing.assert_allclose(S.toarray(), J.to_dense().to(torch.float32).numpy())
+
+    @pytest.mark.parametrize("dt,want", [(torch.float32, np.float32), (F64, np.float64)])
+    def test_full_precision_is_left_alone(self, dt, want):
+        x = torch.linspace(-1, 1, 12, dtype=dt)
+        assert to_scipy(jacobian(band, x)).dtype == want

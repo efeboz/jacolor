@@ -197,6 +197,12 @@ class Widen(torch.autograd.Function):
 
 
 class TestRefusals:
+    def test_complex_input_and_output(self):
+        with pytest.raises(TypeError, match="complex input"):
+            sparsity(lambda z: z * 2, torch.ones(3, dtype=torch.complex128))
+        with pytest.raises(TypeError, match="complex output"):
+            sparsity(lambda z: z * (1 + 2j), torch.ones(3, dtype=F64))
+
     def test_unsupported_op_names_the_op_and_the_line(self):
         def f(z):
             return torch.cumsum(z, 0)
@@ -496,9 +502,16 @@ def test_readme_table_matches_the_registry():
     want = collections.defaultdict(set)
     for name, kind in supported_ops():
         want[kind].add(name)
-    text = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+    readme = pathlib.Path(__file__).resolve().parents[1] / "README.md"
     got = collections.defaultdict(set)
     for kind, ops in re.findall(r"^\| (row map|pointwise|reduction|slice coupling|coupling) \| (.+?) \|$",
-                                text.read_text(), re.M):
+                                readme.read_text(), re.M):
         got[kind] |= {o.strip() for o in ops.split(",")}
-    assert dict(got) == dict(want)
+    assert got, (
+        f"README.md lists no supported-operations table, but the registry has "
+        f"{len(supported_ops())} ops. The table and the registry are committed "
+        "together or this test fails."
+    )
+    missing = {k: sorted(want[k] - got.get(k, set())) for k in want if want[k] - got.get(k, set())}
+    extra = {k: sorted(got[k] - want.get(k, set())) for k in got if got[k] - want.get(k, set())}
+    assert not missing and not extra, f"README missing {missing}, README has extra {extra}"

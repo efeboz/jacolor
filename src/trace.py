@@ -34,6 +34,17 @@ class TraceMismatch(RuntimeError):
     """The traced program does not compute what f computes."""
 
 
+def _real(t, what):
+    # Forward mode gives the holomorphic derivative of a complex function and
+    # reverse mode its conjugate. A result assembled from either, and the check
+    # against them, would need a convention this release does not pick.
+    if t.is_complex():
+        raise TypeError(
+            f"complex {what} is not supported. Forward and reverse mode disagree on "
+            "complex derivatives, one gives the conjugate of the other"
+        )
+
+
 def _where(node):
     # Frames arrive as a "File ..." line followed by a code line. The wrapper in
     # this file is never the answer, so report the innermost frame outside it.
@@ -314,7 +325,9 @@ def sparsity(f, x):
     Both are samples, so they are evidence that the trace stands for f rather than
     a guarantee of it.
     """
+    _real(x, "input")
     y, custom = _eager(f, x)
+    _real(y, "output")
     if custom:
         raise CustomBackward(
             f"the derivative of f goes through a custom autograd.Function "

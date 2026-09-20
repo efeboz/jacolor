@@ -18,9 +18,9 @@ import torch
 from . import _boolcsr as bc
 from .coloring import MAX_EDGES, color_cols, color_rows, graph_estimate
 from .compress import _block, _index
-from .evaluate import _assemble, _pull, _push, _verify
+from .evaluate import _assemble, _check_chunk, _check_verify, _floor, _pull, _push, _verify
 from .interop import pattern as as_pattern
-from .trace import sparsity
+from .trace import _real, sparsity
 
 __all__ = ["prepare", "Prepared"]
 
@@ -64,11 +64,13 @@ class Prepared:
 
     @property
     def optimal(self):
-        """True when the coloring provably cannot be improved for this pattern.
+        """True when the coloring reaches its own lower bound.
 
-        The bound is the densest line, which any coloring must spend a color on.
-        Reaching it settles the question. Falling short of it does not mean the
-        heuristic did badly, because the bound itself can be loose.
+        The bound belongs to one direction, or to one split. Reaching it proves
+        nothing of the same kind can use fewer colors, and says nothing about
+        the others. A pattern can sit at its forward bound and still be cheaper
+        in reverse or split. Falling short does not mean the heuristic did
+        badly either, because the bound itself can be loose.
         """
         return self.n_colors == self.lower_bound
 
@@ -118,7 +120,7 @@ class Prepared:
         self._check(x)
         if self.split:
             J, y, self.status = _assemble_split(
-                self.f, x, self.split, self._index, self.verify
+                self.f, x, self.split, self._index, self.chunk, self.verify
             )
         else:
             J, y, self.status = _assemble(
@@ -134,13 +136,14 @@ class Prepared:
         dense as far as the rules can tell.
         """
         s = self.summary()
+        scope = "this split" if self.split else f"{s['mode']} coloring of this pattern"
         rn = bc.row_nnz(self.pattern)
         cn = bc.row_nnz(bc.transpose(self.pattern))
         out = [f"{s['rows']} by {s['cols']}, {s['nnz']} nonzeros, "
                f"{100 * s['density']:.1f} percent dense",
                f"chose {s['mode']}: {self.reason}",
                f"{s['colors']} colors against a lower bound of {s['lower_bound']}"
-               + (", which is as few as this pattern allows" if s["optimal"] else "")]
+               + (f", which is as few as {scope} allows" if s["optimal"] else "")]
         if rn.size:
             wide = int(rn.max())
             out.append(f"the widest row holds {wide} entries, and {int((rn == wide).sum())} "
@@ -154,7 +157,8 @@ class Prepared:
             rest = int(rn[rn < rn.max()].max())
             out.append(f"setting those {int((rn == rn.max()).sum())} row(s) aside leaves a "
                        f"pattern whose widest row holds {rest}. mode='hybrid' recovers "
-                       "them in reverse and the rest forward")
+                       "them in reverse and the rest forward, and takes that only if it "
+                       "beats both plain directions")
         return "\n".join(out)
 
 
@@ -195,22 +199,42 @@ def _cut(P, rows):
 
 
 def _split_plan(P):
-    """Set aside the rows that force the forward bound, if that pays."""
+    """Set aside the rows that force the forward bound, if that beats both plain modes.
+
+    Returns (split, plain, reason). plain is set when a plain direction was
+    colored for the comparison and won, so the caller need not color it again.
+    A plain direction that cannot be built, or whose lower bound already reaches
+    the split's count, cannot win and is never colored at all.
+    """
     rn = bc.row_nnz(P)
     if P.shape[0] == 0 or P.nnz == 0:
-        return None, "the pattern is empty, so there is nothing to split"
+        return None, None, "the pattern is empty, so there is nothing to split"
     rows = np.flatnonzero(rn == rn.max())
     if rows.size == P.shape[0]:
-        return None, "every row is as dense as the densest, so a split changes nothing"
+        return None, None, "every row is as dense as the densest, so a split changes nothing"
     rest_P, dense_P = _cut(P, rows)
+    if max(graph_estimate(rest_P), graph_estimate(bc.transpose(dense_P))) > MAX_EDGES:
+        return None, None, "a split would not fit in the coloring budget either"
     split = _Split(P, rows, color_cols(rest_P), color_rows(dense_P))
-    plain = color_cols(P).n_colors
-    if split.n_colors >= plain:
-        return None, (f"a split would need {split.n_colors} directions against {plain} "
-                      "for plain forward, so it was not taken")
-    return split, (f"hybrid, {split.rest.n_colors} forward and {split.dense.n_colors} "
-                   f"reverse, against {plain} for plain forward. {rows.size} row(s) hold "
-                   f"{int(rn.max())} entries each and forced that count")
+
+    said, best = [], None
+    for name, Q, color in (("forward", P, color_cols), ("reverse", bc.transpose(P), color_rows)):
+        lb = int(bc.row_nnz(Q).max()) if Q.shape[0] else 0
+        if graph_estimate(Q) > MAX_EDGES:
+            said.append(f"plain {name} would not fit in memory")
+        elif lb >= split.n_colors:
+            said.append(f"plain {name} needs at least {lb}")
+        else:
+            c = color(P)
+            said.append(f"plain {name} needs {c.n_colors}")
+            if c.n_colors < split.n_colors and (best is None or c.n_colors < best[1].n_colors):
+                best = (name, c)
+    if best is not None:
+        name, c = best
+        return None, c, (f"a split would need {split.n_colors} directions against "
+                         f"{c.n_colors} for plain {name}, so it was not taken")
+    return split, None, (f"hybrid, {split.rest.n_colors} forward and {split.dense.n_colors} "
+                         f"reverse, where {' and '.join(said)}")
 
 
 def _split_index(split, device):
@@ -223,27 +247,45 @@ def _split_index(split, device):
             torch.tensor(split.dense.colors[ri]).to(device))
 
 
-def _assemble_split(f, x, split, index, verify):
-    """Each row belongs to one half, and each half is recovered its own way."""
+def _assemble_split(f, x, split, index, chunk, verify):
+    """Each row belongs to one half, and each half is recovered its own way.
+
+    chunk caps the colors in flight within each half, as it does for plain modes.
+    """
     P = split.full
     ri, ci, give, line_f, line_r = index
-
-    S = _block(split.rest, 0, split.rest.n_colors, x.dtype, x.device)
-    primal, B = _push(f, x, S)
-    if B.shape[0] != P.shape[0]:
-        raise ValueError(
-            f"the split is for an output of {P.shape[0]} elements, got {B.shape[0]}"
-        )
-    vals = torch.empty(P.nnz, dtype=B.dtype, device=B.device)
     keep = ~give
-    vals[keep] = B[ri[keep], line_f[keep]]
+    vals = primal = None
 
-    Sr = _block(split.dense, 0, split.dense.n_colors, x.dtype, x.device, lines=split.rows)
-    y, back = torch.func.vjp(f, x)
-    Br = _pull(back, y.shape, Sr.T.contiguous())
-    vals[give] = Br[line_r[give], ci[give]].to(vals.dtype)
+    kf = split.rest.n_colors
+    step = chunk or max(kf, 1)
+    for lo in range(0, kf, step):
+        hi = min(lo + step, kf)
+        primal, B = _push(f, x, _block(split.rest, lo, hi, x.dtype, x.device))
+        if B.shape[0] != P.shape[0]:
+            raise ValueError(
+                f"the split is for an output of {P.shape[0]} elements, got {B.shape[0]}"
+            )
+        if vals is None:
+            vals = torch.empty(P.nnz, dtype=B.dtype, device=B.device)
+        sel = keep & (line_f >= lo) & (line_f < hi)
+        vals[sel] = B[ri[sel], line_f[sel] - lo]
 
-    status = _verify(f, x, ri, ci, vals, P, "cols", primal) if verify else "skipped"
+    _real(primal, "output")
+    y, back = torch.func.vjp(f, x)  # built once, reused by every chunk
+    kr = split.dense.n_colors
+    step = chunk or max(kr, 1)
+    for lo in range(0, kr, step):
+        hi = min(lo + step, kr)
+        Sr = _block(split.dense, lo, hi, x.dtype, x.device, lines=split.rows)
+        Br = _pull(back, y.shape, Sr.T.contiguous())
+        sel = give & (line_r >= lo) & (line_r < hi)
+        vals[sel] = Br[line_r[sel] - lo, ci[sel]].to(vals.dtype)
+
+    # Checked in forward mode, so the rows recovered in reverse are held to a
+    # forward derivative. That is what catches the two modes disagreeing.
+    status = (_verify(f, x, ri, ci, vals, P, "cols", primal, None, _floor(verify))
+              if verify else "skipped")
     J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
     return J, primal, status
 
@@ -300,25 +342,41 @@ def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True):
     known and an operator rule is missing. It is believed as given, so the
     containment it claims is the caller's to get right.
 
-    chunk and verify carry through to every evaluation.
+    chunk and verify carry through to every evaluation. verify may be a dtype,
+    the coarsest precision f computes in, when that is lower than its input and
+    output show.
+
+    "hybrid" recovers the rows that force the forward bound in reverse and the
+    rest forward, and takes that only if it beats both plain directions. It
+    assumes forward and reverse mode describe the same derivative. A no_grad
+    block inside f can break that. sparsity refuses such an f through its own
+    derivative check, and with pattern= the evaluation check is what catches it.
+    Inputs and outputs must be real.
     """
     if mode not in ("auto", "forward", "reverse", "hybrid"):
         raise ValueError(
             f"mode must be auto, forward, reverse or hybrid, got {mode!r}"
         )
+    _check_chunk(chunk)  # before tracing, so a bad value costs nothing
+    _check_verify(verify)
+    _real(x, "input")
     P = sparsity(f, x) if pattern is None else as_pattern(pattern)
     if P.shape[1] != x.numel():
         raise ValueError(
             f"the pattern has {P.shape[1]} columns, x has {x.numel()} elements"
         )
     if mode == "hybrid":
-        split, reason = _split_plan(P)
+        split, plain, why = _split_plan(P)
         sig = (tuple(x.shape), x.dtype, x.device)
         if split is not None:
-            return Prepared(f, split.rest, sig, chunk, verify, reason, split)
-        coloring = color_cols(P)  # the split did not pay, so say so and go plain
-        return Prepared(f, coloring, sig, chunk, verify,
-                        f"forward, {coloring.n_colors} colors. {reason}")
+            return Prepared(f, split.rest, sig, chunk, verify, why, split)
+        if plain is None:  # declined before any plain direction was colored
+            plain, choice = _plan(P)
+            why = f"{choice}. {why}"
+        else:
+            name = "forward" if plain.axis == "cols" else "reverse"
+            why = f"{name}, {plain.n_colors} colors. {why}"
+        return Prepared(f, plain, sig, chunk, verify, why)
     if mode == "auto":
         coloring, reason = _plan(P)
     else:
