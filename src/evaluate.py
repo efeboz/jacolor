@@ -28,6 +28,10 @@ __all__ = ["jacobian", "VerificationError", "VerificationInconclusive"]
 # and float32, 0.07 in float16, 0.55 in bfloat16, so bfloat16 lands outside.
 _RESOLVE = 0.25
 
+# AD passes the search for a missing entry may spend. Bisection, so this covers
+# a line of 2**16 entries, and running out is reported rather than concluded.
+_PROBE_PASSES = 32
+
 
 class VerificationError(RuntimeError):
     """The assembled Jacobian disagrees with autograd on f."""
@@ -63,9 +67,13 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None, floor=None):
     """Check the assembled entries against one directional derivative.
 
     A sound pattern gives the same answer whether the direction goes through
-    autograd or through the entries, so a disagreement means the structure does
-    not belong to this function at this point. One point and one direction, so
-    agreement is evidence and not a proof.
+    autograd or through the entries. One point and one direction, so agreement
+    is evidence and not a proof.
+
+    A disagreement is not, by itself, evidence against the pattern. Both sides
+    come from f's own derivative and carry its rounding, which cancellation
+    inside f can make far larger than the entries suggest. So a disagreement is
+    put to the structure, in _missing, before it is called an error.
 
     floor is the coarsest precision f computes in, when that is lower than its
     input and output show.
@@ -101,8 +109,9 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None, floor=None):
     # as checkable, and a low-precision dtype is not held to float64 accuracy.
     # Casting the oracle to float64 does not make the arithmetic behind it
     # float64, so the input's precision counts as much as the result's, and so
-    # does any lower one f declares it uses inside.
-    eps = max(_eps(vals.dtype), _eps(want.dtype), _eps(x.dtype),
+    # does any lower one f declares it uses inside. The oracle carries the same
+    # dtype as the entries, so it needs no term of its own.
+    eps = max(_eps(vals.dtype), _eps(x.dtype),
               _eps(floor) if floor is not None else 0.0)
     scale = want.abs() + mag
     room = eps * (32.0 + cnt) * scale
@@ -117,15 +126,29 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None, floor=None):
         ), stacklevel=3)
         return "inconclusive"
     if bool((off > room).any()):
+        # Both sides come from f's own derivative, so numbers alone cannot say
+        # whether the pattern is wrong or f rounded badly. Ask the structure.
         i = int((off - room).argmax())
-        raise VerificationError(
-            "the assembled Jacobian disagrees with autograd on f. The pattern does "
-            "not describe this function at this point, which happens when a reused "
-            f"coloring is stale. Worst entry {i}: {float(acc[i])} against "
-            f"{float(want[i])}, allowing {float(room[i])}. If f computes at lower "
-            "precision inside than its input and output show, pass that dtype as "
-            "verify, for instance verify=torch.float32."
-        )
+        found, why = _missing(f, x, ri, ci, P, axis, i, primal, back, g)
+        if found is not None:
+            j, at_j = found
+            r, c = (i, j) if axis == "cols" else (j, i)
+            raise VerificationError(
+                f"f's derivative returns {at_j:.3g} at entry ({r}, {c}), which the "
+                "pattern does not hold, so a color carries it onto another entry and "
+                "the assembled Jacobian is wrong. This is what a reused coloring gone "
+                f"stale looks like. Line {i} disagrees with autograd by "
+                f"{float(off[i]):.3g} of a scale of {float(scale[i]):.3g}."
+            )
+        warnings.warn(VerificationInconclusive(
+            f"line {i} disagrees with autograd by {float(off[i]):.3g} of a scale of "
+            f"{float(scale[i]):.3g}, which is more than rounding accounts for, and "
+            f"{why}. Cancellation inside f's own derivative does this, and so does a "
+            "hybrid whose two modes disagree. If f computes at lower precision inside "
+            "than its input and output show, pass that dtype as verify. The result is "
+            "unchecked."
+        ), stacklevel=3)
+        return "inconclusive"
     # Agreeing inside a rounding allowance as large as the answer says nothing.
     # The scale has to include the answer, not only the terms that were summed:
     # cancellation leaves no terms at all, and gating on those would let a
@@ -140,6 +163,60 @@ def _verify(f, x, ri, ci, vals, P, axis, primal=None, back=None, floor=None):
         ), stacklevel=3)
         return "inconclusive"
     return "ok"
+
+
+def _line(f, x, axis, i, primal, back, cols, w):
+    """Line i of f's derivative over cols, weighted by w, as one AD pass.
+
+    Forward for entries that came from tangents and reverse for entries that
+    came from adjoints, so the evidence is the derivative the entries are. The
+    other mode may not exist for f, and where both exist they can disagree.
+    """
+    if axis == "cols":  # a row of J, from a tangent along those columns
+        u = torch.zeros(x.numel(), dtype=x.dtype, device=x.device)
+        u[cols] = w.to(u.dtype).to(u.device)
+        return float(torch.func.jvp(f, (x,), (u.reshape(x.shape),))[1].reshape(-1)[i])
+    u = torch.zeros(primal.numel(), dtype=primal.dtype, device=x.device)  # a column
+    u[cols] = w.to(u.dtype).to(u.device)
+    return float(back(u.reshape(primal.shape))[0].reshape(-1)[i])
+
+
+def _missing(f, x, ri, ci, P, axis, i, primal, back, g):
+    """Look for an entry of line i that f's derivative has and the pattern lacks.
+
+    Bisection over what the pattern leaves out, one AD pass per step, within a
+    budget. Returns ((index, value), "") for an entry that carries a derivative,
+    or (None, why) when the search came up empty, which is not the same as the
+    pattern being complete. Sums are what hide an entry, through cancellation,
+    so the search goes on until one entry is left and reads that alone.
+    """
+    n = P.shape[1] if axis == "cols" else P.shape[0]
+    held = ci[ri == i] if axis == "cols" else ri[ci == i]
+    rest = torch.ones(n, dtype=torch.bool, device=x.device)
+    rest[held] = False
+    rest = torch.nonzero(rest).reshape(-1)
+    if rest.numel() == 0:
+        return None, "the pattern holds every entry of that line, so none is missing"
+
+    left = _PROBE_PASSES
+    while rest.numel() > 1:
+        if left < 2:
+            return None, "the search for an entry it leaves out ran out of passes"
+        half = rest.numel() // 2
+        parts = (rest[:half], rest[half:])
+        seen = [abs(_line(f, x, axis, i, primal, back, part,
+                          torch.randn(part.numel(), generator=g)))
+                for part in parts]
+        left -= 2
+        if max(seen) == 0.0:
+            return None, "nothing it leaves out moved that line"
+        rest = parts[0] if seen[0] >= seen[1] else parts[1]
+    if left < 1:
+        return None, "the search for an entry it leaves out ran out of passes"
+    at_j = _line(f, x, axis, i, primal, back, rest, torch.ones(1))
+    if at_j == 0.0:
+        return None, "nothing it leaves out moved that line"
+    return (int(rest[0]), at_j), ""
 
 
 def _check_verify(verify):
@@ -237,7 +314,9 @@ def jacobian(f, x, coloring=None, chunk=None, verify=True):
     VerificationInconclusive rather than reporting a pass. Turn it off only in a
     loop you have already verified. If f computes at lower precision inside than
     its input and output show, pass that dtype instead, as verify=torch.float32,
-    and the tolerance allows for it.
+    and the tolerance allows for it. A disagreement raises only where f's
+    derivative holds something the pattern does not, and is otherwise reported
+    as unchecked.
 
     Inputs and outputs must be real. For complex f the two AD modes give
     conjugate answers, and this release does not pick between them.

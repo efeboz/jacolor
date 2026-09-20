@@ -30,6 +30,11 @@ class CustomBackward(RuntimeError):
     """A custom autograd.Function takes part in the derivative of f."""
 
 
+# Past this, a dtype's own rounding swamps the comparison, so the tolerance
+# stops following it rather than letting the check accept anything.
+_COARSE = 0.05
+
+
 class TraceMismatch(RuntimeError):
     """The traced program does not compute what f computes."""
 
@@ -302,6 +307,23 @@ def _walk(ep, x):
     return P, val[res]
 
 
+def _agree(got, want, bound):
+    """Two tensors to a tolerance that follows the dtype, not float64.
+
+    A float32 matmul and its traced form differ in their last bits, and a fixed
+    float64 bound refuses f for its arithmetic rather than for its program. The
+    tolerance is capped, or a dtype coarse enough would turn the check off.
+    """
+    eps = float(torch.finfo(want.dtype).eps) if want.dtype.is_floating_point else 0.0
+    tol = min(max(bound, 64.0 * eps), _COARSE)
+    # A nan or an infinity carries no scale, and taking one would leave the
+    # tolerance nan and refuse everything. allclose compares those itself.
+    finite = torch.nan_to_num(want.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    scale = float(finite.abs().max()) if want.numel() else 0.0
+    return got.shape == want.shape and torch.allclose(got, want, rtol=tol,
+                                                      atol=tol * scale, equal_nan=True)
+
+
 def _same_derivative(f, traced, x):
     # Reverse mode, because its operator coverage is the wider of the two. One
     # direction at one point, so this is evidence rather than proof.
@@ -311,7 +333,7 @@ def _same_derivative(f, traced, x):
         w = torch.randn(y.shape, generator=g).to(y.dtype).to(x.device)
         want = back(w)[0]
         got = torch.func.vjp(traced, x)[1](w)[0]
-    return torch.allclose(got, want, rtol=1e-6, atol=1e-9, equal_nan=True)
+    return _agree(got, want, 1e-6)
 
 
 def sparsity(f, x):
@@ -339,8 +361,7 @@ def sparsity(f, x):
         P, traced = _walk(ep, x)
     # Export may specialize a branch, so the traced program can compute something
     # other than f. A pattern taken from it would then describe the wrong function.
-    same = traced.shape == y.shape and torch.allclose(traced, y, rtol=1e-9, atol=1e-12,
-                                                      equal_nan=True)
+    same = _agree(traced, y, 1e-9)
     if same:
         # Equal values are not enough. The two programs can agree at a point and
         # still have different derivatives, which is the only thing the pattern

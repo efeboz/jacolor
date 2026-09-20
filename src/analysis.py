@@ -118,6 +118,9 @@ class Prepared:
     def value_and_jacobian(self, x):
         """f at x and its sparse Jacobian, which a nonlinear solver wants together."""
         self._check(x)
+        _check_chunk(self.chunk)  # both can be set again after preparing
+        _check_verify(self.verify)
+        self.status = None  # until this evaluation gets that far
         if self.split:
             J, y, self.status = _assemble_split(
                 self.f, x, self.split, self._index, self.chunk, self.verify
@@ -203,8 +206,9 @@ def _split_plan(P):
 
     Returns (split, plain, reason). plain is set when a plain direction was
     colored for the comparison and won, so the caller need not color it again.
-    A plain direction that cannot be built, or whose lower bound already reaches
-    the split's count, cannot win and is never colored at all.
+    A tie counts as a win for the plain direction, since it costs the same and
+    stays in one mode. A plain direction that cannot be built, or whose lower
+    bound already passes the split's count, cannot win and is never colored.
     """
     rn = bc.row_nnz(P)
     if P.shape[0] == 0 or P.nnz == 0:
@@ -222,12 +226,12 @@ def _split_plan(P):
         lb = int(bc.row_nnz(Q).max()) if Q.shape[0] else 0
         if graph_estimate(Q) > MAX_EDGES:
             said.append(f"plain {name} would not fit in memory")
-        elif lb >= split.n_colors:
+        elif lb > split.n_colors:
             said.append(f"plain {name} needs at least {lb}")
         else:
             c = color(P)
             said.append(f"plain {name} needs {c.n_colors}")
-            if c.n_colors < split.n_colors and (best is None or c.n_colors < best[1].n_colors):
+            if c.n_colors <= split.n_colors and (best is None or c.n_colors < best[1].n_colors):
                 best = (name, c)
     if best is not None:
         name, c = best
@@ -350,7 +354,8 @@ def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True):
     rest forward, and takes that only if it beats both plain directions. It
     assumes forward and reverse mode describe the same derivative. A no_grad
     block inside f can break that. sparsity refuses such an f through its own
-    derivative check, and with pattern= the evaluation check is what catches it.
+    derivative check. With pattern= nothing refuses it, and the evaluation check
+    reports the result unchecked, since the pattern is not what is wrong.
     Inputs and outputs must be real.
     """
     if mode not in ("auto", "forward", "reverse", "hybrid"):
