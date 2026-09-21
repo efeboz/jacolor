@@ -6,7 +6,7 @@ import torch
 
 from src import _boolcsr as bc, coloring as cl
 from src.evaluate import VerificationError, VerificationInconclusive, jacobian
-from src.trace import sparsity
+from src.trace import TraceUnchecked, sparsity
 
 F64 = torch.float64
 CONV = torch.nn.functional.conv2d
@@ -14,6 +14,19 @@ CONV = torch.nn.functional.conv2d
 
 def dense_jac(f, x):
     return torch.func.jacrev(f)(x).reshape(-1, x.numel())
+
+
+# Dtypes whose own rounding is wider than a difference between two programs,
+# so a trace in one cannot be checked and says so.
+COARSE = (torch.float16, torch.bfloat16)
+
+
+def traced(f, x):
+    # The pattern, plus the fact that a coarse dtype leaves it unchecked.
+    if x.dtype in COARSE:
+        with pytest.warns(TraceUnchecked):
+            return sparsity(f, x)
+    return sparsity(f, x)
 
 
 def band(x):
@@ -173,6 +186,16 @@ class TestStaleStructure:
         with pytest.raises(VerificationError, match="stale"):
             jacobian(m, x, coloring=c)
 
+    def test_a_small_missing_entry_in_a_wide_row_is_caught(self):
+        # The allowance follows the terms the line holds, not its width, or a
+        # row of five thousand would excuse anything small.
+        n = 5000
+        f = lambda z: (z[0] + z[1] + 1e-12 * z[2]).reshape(1)
+        x = torch.randn(n, generator=torch.Generator().manual_seed(17), dtype=F64)
+        P = bc.from_pairs(np.zeros(2, int), np.array([0, 1]), (1, n))
+        with pytest.raises(VerificationError, match=r"returns .* at entry \(0, 2\)"):
+            jacobian(f, x, coloring=cl.color_cols(P))
+
     def test_verify_off_returns_the_wrong_answer_quietly(self):
         # The escape hatch really does skip the check, which is why it is not
         # the default.
@@ -322,7 +345,7 @@ class TestLowPrecisionDtypes:
     @pytest.mark.parametrize("dt", LOW, ids=LOW_IDS)
     def test_verification_accepts_a_correct_result(self, dt, axis):
         x = torch.linspace(-1, 1, 12, dtype=dt)
-        P = sparsity(band, x)
+        P = traced(band, x)
         c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", VerificationInconclusive)
@@ -335,9 +358,11 @@ class TestLowPrecisionDtypes:
     @pytest.mark.parametrize("dt", LOW, ids=LOW_IDS)
     def test_softmax_is_accepted_too(self, dt):
         f = lambda z: torch.softmax(z.reshape(2, 6), dim=1).reshape(-1)
+        x = torch.linspace(-1, 1, 12, dtype=dt)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", VerificationInconclusive)
-            jacobian(f, torch.linspace(-1, 1, 12, dtype=dt))
+            warnings.simplefilter("ignore", TraceUnchecked)
+            jacobian(f, x)
 
 
 class TestVerificationOutcomes:
@@ -400,7 +425,7 @@ class TestVerificationOutcomes:
 
         m = Slicer()
         x = torch.linspace(-1, 1, 4, dtype=torch.bfloat16)
-        c = cl.color_cols(sparsity(m, x))
+        c = cl.color_cols(traced(m, x))
         m.start = 1
         with pytest.raises(VerificationError):
             jacobian(m, x, coloring=c)
@@ -418,7 +443,11 @@ class TestCancellationCannotHideAWrongPattern:
         from src.analysis import prepare
 
         x = torch.randn(256, generator=torch.Generator().manual_seed(30), dtype=dtype)
-        p = prepare(self.HEAD, x, mode=mode)
+        if dtype in COARSE:  # the trace cannot be checked there, which is its own test
+            with pytest.warns(TraceUnchecked):
+                p = prepare(self.HEAD, x, mode=mode)
+        else:
+            p = prepare(self.HEAD, x, mode=mode)
         p.f = self.DIFF
         return p, x
 
@@ -456,25 +485,36 @@ class TestMixedPrecisionTolerance:
     ], ids=["z*z*k", "z*k", "tanh"])
     def test_a_correct_float32_input_is_accepted(self, name, f):
         x = torch.randn(4, generator=torch.Generator().manual_seed(31), dtype=torch.float32)
-        J = jacobian(f, x)  # raises if the tolerance ignores the float32 arithmetic
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            J = jacobian(f, x)
+        # A tolerance that ignores the float32 arithmetic leaves this unchecked.
+        assert not [m for m in w if isinstance(m.message, VerificationInconclusive)]
         torch.testing.assert_close(J.to_dense(), torch.func.jacrev(f)(x).to(F64),
                                    rtol=1e-6, atol=1e-6)
 
     # float64 in and out, float32 inside. Nothing at the boundary shows it.
     LOW = staticmethod(lambda z: (torch.tanh(z.float()) * 3.0).double())
 
-    def test_hidden_float32_fails_and_says_what_to_pass(self):
+    def test_hidden_float32_is_unchecked_and_says_what_to_pass(self):
+        # Nothing is missing from the pattern, so this is not a wrong pattern.
         x = torch.linspace(0.5, 1.0, 6, dtype=F64)
         c = cl.color_cols(bc.from_dense(np.eye(6, dtype=bool)))
-        with pytest.raises(VerificationError, match="verify=torch.float32"):
-            jacobian(self.LOW, x, coloring=c)
+        with pytest.warns(VerificationInconclusive, match="pass that dtype as verify"):
+            J = jacobian(self.LOW, x, coloring=c)
+        torch.testing.assert_close(J.to_dense(), torch.func.jacrev(self.LOW)(x),
+                                   rtol=1e-6, atol=1e-6)
 
     @pytest.mark.parametrize("axis", ["cols", "rows"])
     def test_declaring_it_is_accepted(self, axis):
         x = torch.linspace(0.5, 1.0, 6, dtype=F64)
         P = bc.from_dense(np.eye(6, dtype=bool))
         c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
-        J = jacobian(self.LOW, x, coloring=c, verify=torch.float32)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            J = jacobian(self.LOW, x, coloring=c, verify=torch.float32)
+        # Declared, so the check resolves rather than giving up on it.
+        assert not [m for m in w if isinstance(m.message, VerificationInconclusive)]
         torch.testing.assert_close(J.to_dense(), torch.func.jacrev(self.LOW)(x),
                                    rtol=1e-6, atol=1e-6)
 
@@ -483,6 +523,19 @@ class TestMixedPrecisionTolerance:
         c = cl.color_cols(bc.from_dense(np.roll(np.eye(6, dtype=bool), 1, axis=1)))
         with pytest.raises(VerificationError):
             jacobian(self.LOW, x, coloring=c, verify=torch.float32)
+
+    def test_an_output_coarser_than_the_input_is_accepted(self):
+        # float64 in, float32 out. The entries are float32 and the allowance has
+        # to follow them, not the input.
+        f = lambda z: (torch.tanh(z) * 3.0).float()
+        x = torch.linspace(0.5, 1.0, 6, dtype=F64)
+        c = cl.color_cols(bc.from_dense(np.eye(6, dtype=bool)))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            J = jacobian(f, x, coloring=c)
+        assert not [m for m in w if isinstance(m.message, VerificationInconclusive)]
+        torch.testing.assert_close(J.to_dense().to(F64), torch.func.jacrev(f)(x),
+                                   rtol=1e-6, atol=1e-7)
 
     def test_a_stale_float32_pattern_is_still_caught(self):
         # The wider allowance must not blind the check to a real disagreement.
@@ -552,3 +605,182 @@ class TestComplexIsRefused:
         c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
         with pytest.raises(TypeError, match="complex output"):
             jacobian(lambda z: z * (1 + 2j), torch.ones(4, dtype=F64), coloring=c)
+
+
+class TestSaturationIsNotAWrongPattern:
+    """A softmax at saturated logits computes its own derivative through
+    cancellation, so the entries and the oracle disagree by far more than their
+    magnitudes explain. The pattern is right, and saying it is wrong would be."""
+
+    SM = staticmethod(lambda z: z.softmax(0))
+    SPREAD = [10.0, 20.0, 30.0, 40.0]
+
+    def x(self, k, dt):
+        return torch.tensor([k, 0.0, 0.0, 0.0], dtype=dt)
+
+    @pytest.mark.parametrize("dt", [F64, torch.float32], ids=["float64", "float32"])
+    @pytest.mark.parametrize("axis", ["cols", "rows"])
+    @pytest.mark.parametrize("k", SPREAD, ids=[f"x0={k:g}" for k in SPREAD])
+    def test_a_correct_pattern_is_never_refused(self, k, axis, dt):
+        x = self.x(k, dt)
+        P = sparsity(self.SM, x)
+        c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", VerificationInconclusive)
+            J = jacobian(self.SM, x, coloring=c)
+        torch.testing.assert_close(J.to_dense(), torch.func.jacrev(self.SM)(x))
+
+    @pytest.mark.parametrize("k", SPREAD, ids=[f"x0={k:g}" for k in SPREAD])
+    def test_the_unresolved_check_says_so_rather_than_passing(self, k):
+        x = self.x(k, F64)
+        c = cl.color_cols(sparsity(self.SM, x))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            jacobian(self.SM, x, coloring=c)
+        said = [m for m in w if isinstance(m.message, VerificationInconclusive)]
+        assert said, "a disagreement beyond rounding must not read as a pass"
+        assert "holds every entry of that line" in str(said[0].message)
+
+    @pytest.mark.parametrize("k", SPREAD, ids=[f"x0={k:g}" for k in SPREAD])
+    def test_a_missing_entry_is_still_caught_there(self, k):
+        # The same saturation, with one column dropped from the pattern.
+        x = self.x(k, F64)
+        P = bc.from_dense(np.array([[1, 1, 1, 0]] * 4, dtype=bool))
+        with pytest.raises(VerificationError, match=r"entry \(\d+, 3\)"):
+            jacobian(self.SM, x, coloring=cl.color_cols(P))
+
+    def test_the_error_names_what_is_missing(self):
+        x = torch.linspace(-1, 1, 4, dtype=F64)
+        P = bc.from_dense(np.array([[1, 1, 1, 0]] * 4, dtype=bool))
+        with pytest.raises(VerificationError) as e:
+            jacobian(self.SM, x, coloring=cl.color_cols(P))
+        msg = str(e.value)
+        assert "the pattern does not hold" in msg and "stale" in msg
+
+
+class TestTheSearchStaysInItsMode:
+    """Evidence about the entries has to come from the derivative the entries
+    are. The other mode may not exist for f, and where both exist they can
+    describe different derivatives."""
+
+    GRID = torch.randn(1, 4, 4, 2, generator=torch.Generator().manual_seed(1), dtype=F64)
+
+    def grid_sample(self, z):
+        y = torch.nn.functional.grid_sample(z.reshape(1, 1, 4, 4), self.GRID,
+                                            align_corners=True)
+        return y.reshape(-1).softmax(0)
+
+    def reverse_only(self):
+        x = torch.randn(16, generator=torch.Generator().manual_seed(2), dtype=F64)
+        try:
+            torch.func.jvp(self.grid_sample, (x,), (torch.ones(16, dtype=F64),))
+        except NotImplementedError:
+            return x, torch.func.jacrev(self.grid_sample)(x)
+        pytest.skip("this torch has forward AD for grid_sample")
+
+    def test_a_reverse_only_operator_is_checked_without_it(self):
+        x, truth = self.reverse_only()
+        c = cl.color_rows(bc.from_dense(truth != 0))
+        J = jacobian(self.grid_sample, x, coloring=c)  # raised NotImplementedError
+        torch.testing.assert_close(J.to_dense(), truth)
+
+    def test_a_reverse_only_operator_is_still_diagnosed(self):
+        x, truth = self.reverse_only()
+        c = cl.color_rows(bc.from_dense(torch.roll(truth, 1, 1) != 0))
+        with pytest.raises(VerificationError, match="at entry"):
+            jacobian(self.grid_sample, x, coloring=c)
+
+    def test_a_mode_that_sees_more_does_not_invent_missing_entries(self):
+        # no_grad hides the offset from reverse mode, not from forward. The
+        # reverse Jacobian is block diagonal and right, and nothing is missing.
+        def blocky(z):
+            with torch.no_grad():
+                off = 0.25 * z.sum()
+            return z.reshape(2, 3).softmax(1).reshape(-1) + off
+
+        x = torch.randn(6, generator=torch.Generator().manual_seed(3), dtype=F64)
+        P = bc.from_dense(torch.func.jacrev(blocky)(x) != 0)
+        assert P.nnz == 18  # block diagonal, not the 36 forward mode would give
+        J = jacobian(blocky, x, coloring=cl.color_rows(P))
+        torch.testing.assert_close(J.to_dense(), torch.func.jacrev(blocky)(x))
+
+    @pytest.mark.parametrize("dt", [torch.bfloat16, F64], ids=["bfloat16", "float64"])
+    def test_omitted_entries_that_cancel_in_a_sum_are_still_found(self, dt):
+        # Three columns of one, a pattern holding only the first. Summed, the
+        # two it leaves out can cancel, so the search reads them one at a time.
+        n = 128
+        f = lambda z: (z[0] + z[75] + z[125]).reshape(1)
+        x = torch.randn(n, generator=torch.Generator().manual_seed(4), dtype=dt)
+        P = bc.from_pairs(np.zeros(1, int), np.zeros(1, int), (1, n))
+        with pytest.raises(VerificationError, match=r"at entry \(0, (75|125)\)"):
+            jacobian(f, x, coloring=cl.color_cols(P))
+
+    def counted(self, monkeypatch):
+        import src.evaluate as ev
+
+        spent = []
+        real = ev._line
+        monkeypatch.setattr(ev, "_line", lambda *a: (spent.append(1), real(*a))[1])
+        return spent
+
+    def test_a_search_that_runs_out_says_so_rather_than_concluding(self, monkeypatch):
+        import src.evaluate as ev
+
+        spent = self.counted(monkeypatch)
+        monkeypatch.setattr(ev, "_PROBE_PASSES", 2)
+        n = 128
+        f = lambda z: (z[0] + z[75] + z[125]).reshape(1)
+        x = torch.randn(n, generator=torch.Generator().manual_seed(4), dtype=F64)
+        P = bc.from_pairs(np.zeros(1, int), np.zeros(1, int), (1, n))
+        with pytest.warns(VerificationInconclusive, match="ran out of passes"):
+            jacobian(f, x, coloring=cl.color_cols(P))
+        assert len(spent) <= 2, "the budget is what stops it, not the line"
+
+    def test_a_probe_that_overflows_resolves_nothing(self):
+        # The line is finite, the probe of what it leaves out is not. An entry
+        # read as an infinity has not been read, so it cannot name one either.
+        def f(z):
+            t = (z[1] - z[2]) * 1e308
+            return (z[0] + 2 * t - t).reshape(1)
+
+        x = torch.zeros(3, dtype=F64)
+        P = bc.from_pairs(np.zeros(1, int), np.zeros(1, int), (1, 3))
+        with pytest.warns(VerificationInconclusive, match="overflowed"):
+            jacobian(f, x, coloring=cl.color_cols(P))
+
+    def test_a_group_that_overflows_stops_the_search(self):
+        # Every entry it leaves out is finite, while a group of them summed is
+        # not. Reading the group settles nothing, so it cannot go on picking a
+        # half from it, and naming the entry it landed on would be an accident.
+        from src.analysis import prepare
+
+        f = lambda z: (z[0] + (z[1] - z[2]) * 1.5e308).reshape(1)
+        x = torch.zeros(6, dtype=F64)
+        P = np.zeros((1, 6), dtype=bool)
+        P[0, 0] = True
+        p = prepare(f, x, mode="forward", pattern=P)
+        with pytest.warns(VerificationInconclusive, match="overflowed"):
+            p.jacobian(x)
+        assert p.status == "inconclusive"
+
+    def test_a_line_with_nothing_outside_it_stops_after_one_split(self, monkeypatch):
+        # Every entry the pattern leaves out is zero, so there is nothing to
+        # find and no reason to spend the budget looking.
+        spent = self.counted(monkeypatch)
+        f = lambda z: (torch.tanh(z.float()) * 3.0).double()
+        x = torch.linspace(0.5, 1.0, 6, dtype=F64)
+        c = cl.color_cols(bc.from_dense(np.eye(6, dtype=bool)))
+        with pytest.warns(VerificationInconclusive):
+            jacobian(f, x, coloring=c)
+        assert len(spent) <= 2
+
+    def test_an_omitted_entry_that_is_zero_is_not_blamed(self):
+        # The line leaves out one entry and that entry is genuinely zero, so the
+        # disagreement, which is f's float32 arithmetic, is not the pattern.
+        f = lambda z: (torch.tanh(z.float()) * 3.0).double()
+        x = torch.linspace(0.5, 1.0, 2, dtype=F64)
+        c = cl.color_cols(bc.from_dense(np.eye(2, dtype=bool)))
+        with pytest.warns(VerificationInconclusive, match="nothing it leaves out"):
+            J = jacobian(f, x, coloring=c)
+        torch.testing.assert_close(J.to_dense(), torch.func.jacrev(f)(x),
+                                   rtol=1e-6, atol=1e-7)

@@ -13,6 +13,7 @@ still has the graph it was built from, so the result is checked against one
 directional derivative from autograd before it is returned.
 """
 
+import math
 import warnings
 
 import torch
@@ -28,8 +29,9 @@ __all__ = ["jacobian", "VerificationError", "VerificationInconclusive"]
 # and float32, 0.07 in float16, 0.55 in bfloat16, so bfloat16 lands outside.
 _RESOLVE = 0.25
 
-# AD passes the search for a missing entry may spend. Bisection, so this covers
-# a line of 2**16 entries, and running out is reported rather than concluded.
+# AD passes the search for a missing entry may spend. Two per split and one to
+# read the entry, so this covers a line of 2**15, and running out is reported
+# rather than concluded.
 _PROBE_PASSES = 32
 
 
@@ -208,12 +210,16 @@ def _missing(f, x, ri, ci, P, axis, i, primal, back, g):
                           torch.randn(part.numel(), generator=g)))
                 for part in parts]
         left -= 2
+        if not all(math.isfinite(v) for v in seen):
+            return None, "reading what it leaves out overflowed"
         if max(seen) == 0.0:
             return None, "nothing it leaves out moved that line"
         rest = parts[0] if seen[0] >= seen[1] else parts[1]
     if left < 1:
         return None, "the search for an entry it leaves out ran out of passes"
     at_j = _line(f, x, axis, i, primal, back, rest, torch.ones(1))
+    if not math.isfinite(at_j):
+        return None, "reading what it leaves out overflowed"
     if at_j == 0.0:
         return None, "nothing it leaves out moved that line"
     return (int(rest[0]), at_j), ""

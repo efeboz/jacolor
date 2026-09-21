@@ -11,13 +11,15 @@ that has no rule, and a custom autograd.Function, whose backward the trace never
 sees.
 """
 
+import warnings
+
 import torch
 
 from . import _boolcsr as bc
 from . import propagate as pr
 
 __all__ = ["sparsity", "supported_ops", "UnsupportedOp", "CustomBackward",
-           "TraceMismatch"]
+           "TraceMismatch", "TraceUnchecked"]
 
 aten = torch.ops.aten
 
@@ -34,9 +36,17 @@ class CustomBackward(RuntimeError):
 # stops following it rather than letting the check accept anything.
 _COARSE = 0.05
 
+# A comparison looser than this cannot tell two programs apart, since it allows
+# more than the difference between them need be.
+_UNRESOLVED = 1e-3
+
 
 class TraceMismatch(RuntimeError):
     """The traced program does not compute what f computes."""
+
+
+class TraceUnchecked(UserWarning):
+    """The trace could not be told from a different program, so it stands unchecked."""
 
 
 def _real(t, what):
@@ -307,21 +317,44 @@ def _walk(ep, x):
     return P, val[res]
 
 
-def _agree(got, want, bound):
-    """Two tensors to a tolerance that follows the dtype, not float64.
+def _tol(dtype, bound):
+    """How far apart the same program may land in this dtype, relative to scale.
 
     A float32 matmul and its traced form differ in their last bits, and a fixed
     float64 bound refuses f for its arithmetic rather than for its program. The
     tolerance is capped, or a dtype coarse enough would turn the check off.
     """
-    eps = float(torch.finfo(want.dtype).eps) if want.dtype.is_floating_point else 0.0
-    tol = min(max(bound, 64.0 * eps), _COARSE)
+    eps = float(torch.finfo(dtype).eps) if dtype.is_floating_point else 0.0
+    return min(max(bound, 64.0 * eps), _COARSE)
+
+
+def _agree(got, want, bound):
+    """Two tensors to a tolerance that follows the dtype, not float64.
+
+    Returns (agree, why). why is None when the comparison could resolve what it
+    was looking at, and otherwise says what stopped it: a dtype whose rounding
+    is wider than two programs need differ by, or an entry so far below the
+    largest one that it is compared against that scale rather than itself.
+    """
+    if got.shape != want.shape:
+        return False, None
     # A nan or an infinity carries no scale, and taking one would leave the
     # tolerance nan and refuse everything. allclose compares those itself.
-    finite = torch.nan_to_num(want.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    # float64 throughout, since narrowing turns a large value into an infinity
+    # and a small one into zero, and either way the scale would be lost.
+    finite = torch.nan_to_num(want.double(), nan=0.0, posinf=0.0, neginf=0.0)
     scale = float(finite.abs().max()) if want.numel() else 0.0
-    return got.shape == want.shape and torch.allclose(got, want, rtol=tol,
-                                                      atol=tol * scale, equal_nan=True)
+    tol = _tol(want.dtype, bound)
+    agree = bool(torch.allclose(got, want, rtol=tol, atol=tol * scale, equal_nan=True))
+    if tol > _UNRESOLVED:
+        return agree, (f"comparing it with f in {want.dtype} allows {tol:.2g} of the "
+                       "scale, which is more than two different programs need differ by")
+    apart = (got.double() - want.double()).abs()
+    if bool((apart > tol * want.double().abs()).any()):
+        return agree, ("it agrees with f on an entry only against the scale of the "
+                       "largest one, so that entry could be a different dependency "
+                       "and not show")
+    return agree, None
 
 
 def _same_derivative(f, traced, x):
@@ -333,7 +366,7 @@ def _same_derivative(f, traced, x):
         w = torch.randn(y.shape, generator=g).to(y.dtype).to(x.device)
         want = back(w)[0]
         got = torch.func.vjp(traced, x)[1](w)[0]
-    return _agree(got, want, 1e-6)
+    return _agree(got, want, 1e-6)  # (agree, why)
 
 
 def sparsity(f, x):
@@ -361,12 +394,24 @@ def sparsity(f, x):
         P, traced = _walk(ep, x)
     # Export may specialize a branch, so the traced program can compute something
     # other than f. A pattern taken from it would then describe the wrong function.
-    same = _agree(traced, y, 1e-9)
+    same, why = _agree(traced, y, 1e-9)
     if same:
         # Equal values are not enough. The two programs can agree at a point and
         # still have different derivatives, which is the only thing the pattern
-        # is about, so compare a directional derivative as well.
-        same = _same_derivative(f, ep.module(), x)
+        # is about, so compare a directional derivative as well. It runs in the
+        # input's dtype, which need not be the output's, so it answers for
+        # itself rather than for y.
+        same, also = _same_derivative(f, ep.module(), x)
+        why = why or also
+    if same and why is not None:
+        # Agreement the comparison cannot resolve is not evidence. The pattern is
+        # built anyway, since its structure rarely turns on the dtype, but
+        # nothing here stands behind it and saying so is the least of it.
+        warnings.warn(TraceUnchecked(
+            f"this pattern is not checked against f, because {why}. Every evaluation "
+            "is still checked, and tracing in float32 or float64 and passing the "
+            "pattern to prepare is what checks the pattern itself."
+        ), stacklevel=2)
     if not same:
         raise TraceMismatch(
             "the traced program does not agree with f on the example input, so the "

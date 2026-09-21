@@ -1,10 +1,13 @@
+import warnings
+
 import numpy as np
 import pytest
 import torch
 
 from src import _boolcsr as bc, coloring as cl
 from src.compress import decompress, seeds
-from src.trace import CustomBackward, TraceMismatch, UnsupportedOp, sparsity
+from src.trace import (CustomBackward, TraceMismatch, TraceUnchecked, UnsupportedOp,
+                       sparsity)
 
 F64 = torch.float64
 CONV = torch.nn.functional.conv2d
@@ -332,6 +335,105 @@ class TestTraceFidelity:
         # while f computes z + z.sum(). The pattern would be the wrong shape of
         # dependency entirely, and the values silently wrong with it.
         f = lambda z: z if torch.compiler.is_compiling() else z + z.sum()
+        with pytest.raises(TraceMismatch, match="does not agree with f"):
+            sparsity(f, torch.randn(3, dtype=F64))
+
+    @pytest.mark.parametrize("dt", [F64, torch.float32, torch.float16, torch.bfloat16],
+                             ids=["float64", "float32", "float16", "bfloat16"])
+    def test_a_specialized_branch_is_refused_in_every_dtype(self, dt):
+        # The tolerance follows the dtype, so it must not follow it so far that
+        # a coarse one accepts a different program.
+        f = lambda z: z if torch.compiler.is_compiling() else z + z.sum()
+        with pytest.raises(TraceMismatch, match="does not agree with f"):
+            sparsity(f, torch.linspace(-1, 1, 6, dtype=dt))
+
+    @pytest.mark.parametrize("dt", [F64, torch.float32], ids=["float64", "float32"])
+    def test_arithmetic_that_rounds_differently_is_not_a_mismatch(self, dt):
+        # A matmul and its traced form sum in a different order, which in float32
+        # shows in the last bits. That is f's arithmetic, not a different f.
+        g = torch.Generator().manual_seed(16)
+        W = torch.randn(24, 24, generator=g, dtype=dt)
+        k = torch.randn(1, 1, 3, 3, generator=g, dtype=dt)
+        for f, n in ((lambda z: W @ z, 24),
+                     (lambda z: CONV(z.reshape(1, 1, 6, 6), k, padding=1).reshape(-1), 36)):
+            x = torch.randn(n, generator=g, dtype=dt)
+            P = sparsity(f, x)  # refused before the tolerance followed the dtype
+            nz = (torch.func.jacrev(f)(x).reshape(-1, n) != 0).numpy()
+            assert not (nz & ~P.toarray()).any()
+
+    def test_an_entry_that_cancels_to_near_zero_is_not_a_mismatch(self):
+        # The output of this one holds entries that cancel to almost nothing,
+        # where the last bits of a float32 matmul are the whole value. The
+        # tolerance follows the scale of the output, not of that entry, and it
+        # says so, because agreement against that scale settles nothing there.
+        g = torch.Generator().manual_seed(21)
+        W = torch.randn(24, 24, generator=g, dtype=torch.float32)
+        x = torch.randn(24, generator=g, dtype=torch.float32)
+        f = lambda z: W @ z - (W @ z).mean()
+        with pytest.warns(TraceUnchecked, match="against the scale of the largest"):
+            assert sparsity(f, x).shape == (24, 24)
+
+    def test_a_derivative_that_cancels_is_reported_too(self):
+        # Both comparisons count. Here the values resolve and the derivative
+        # does not, since the adjoint of a centred input cancels the same way.
+        g = torch.Generator().manual_seed(1)
+        W = torch.randn(16, 16, generator=g, dtype=torch.float32)
+        x = torch.randn(16, generator=g, dtype=torch.float32)
+        with pytest.warns(TraceUnchecked, match="against the scale of the largest"):
+            sparsity(lambda z: W @ (z - z.mean()), x)
+
+    def test_an_ordinary_trace_says_nothing(self):
+        g = torch.Generator().manual_seed(21)
+        W = torch.randn(24, 24, generator=g, dtype=torch.float32)
+        x = torch.randn(24, generator=g, dtype=torch.float32)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sparsity(lambda z: W @ z, x)
+            sparsity(band, torch.linspace(-1, 1, 12, dtype=F64))
+        assert not [m for m in w if isinstance(m.message, TraceUnchecked)]
+
+    SMALL = staticmethod(
+        lambda z: z if torch.compiler.is_compiling() else z + 0.01 * z.sum())
+
+    @pytest.mark.parametrize("dt", [F64, torch.float32], ids=["float64", "float32"])
+    def test_a_small_difference_in_program_is_still_refused(self, dt):
+        # One percent apart, which is under the tolerance a coarse dtype needs.
+        with pytest.raises(TraceMismatch):
+            sparsity(self.SMALL, torch.zeros(3, dtype=dt))
+
+    @pytest.mark.parametrize("dt", [torch.float16, torch.bfloat16],
+                             ids=["float16", "bfloat16"])
+    def test_a_dtype_too_coarse_to_check_says_so(self, dt):
+        # The same one percent, where the comparison allows five. The pattern is
+        # built, because its structure rarely turns on the dtype, but a trace
+        # nothing can stand behind must not pass for a checked one.
+        with pytest.warns(TraceUnchecked, match="more than two different programs"):
+            P = sparsity(self.SMALL, torch.zeros(3, dtype=dt))
+        assert P.shape == (3, 3)
+
+    @pytest.mark.parametrize("k", [1.0, 1e100, 1e-100, 1e-300],
+                             ids=["one", "1e100", "1e-100", "1e-300"])
+    def test_the_scale_is_measured_where_the_values_live(self, k):
+        # Narrowing to float32 to measure it turns 1e100 into an infinity and
+        # 1e-100 into zero, and either way the tolerance goes with it.
+        from src.trace import _agree
+
+        want = torch.tensor([1.0, 1.0, 0.0], dtype=F64) * k
+        got = want.clone()
+        got[2] = 1e-16 * k  # an entry that cancels, off by a rounding of the scale
+        assert _agree(got, want, 1e-9)[0]
+
+    def test_a_traced_shape_that_differs_is_caught(self):
+        # Nothing compares across shapes, so this has to be seen before the
+        # values are, or it raises from inside the comparison instead.
+        f = lambda z: z if torch.compiler.is_compiling() else torch.cat([z, z])
+        with pytest.raises(TraceMismatch, match="does not agree with f"):
+            sparsity(f, torch.randn(3, dtype=F64))
+
+    def test_a_difference_in_value_alone_is_caught(self):
+        # Same derivative, different function. Only the value check sees this
+        # one, which is why it is not the derivative check on its own.
+        f = lambda z: z + (0.0 if torch.compiler.is_compiling() else 1.0)
         with pytest.raises(TraceMismatch, match="does not agree with f"):
             sparsity(f, torch.randn(3, dtype=F64))
 

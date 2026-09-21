@@ -4,7 +4,7 @@ import torch
 
 from src import coloring as cl
 from src.analysis import Prepared, prepare
-from src.evaluate import VerificationError
+from src.evaluate import VerificationError, VerificationInconclusive
 from src.trace import sparsity
 
 F64 = torch.float64
@@ -240,6 +240,16 @@ class TestPlanner:
         for mode in ("forward", "reverse"):
             assert prepare(band, randn(12, 21), mode=mode).reason.startswith(mode)
 
+    def test_a_failed_evaluation_does_not_leave_the_old_status(self):
+        x = randn(12, 62)
+        p = prepare(band, x)
+        p.jacobian(x)
+        assert p.status == "ok"
+        p.f = lambda z: torch.roll(band(z), 1)  # same shape, different structure
+        with pytest.raises(VerificationError):
+            p.jacobian(x)
+        assert p.status is None and p.summary()["status"] is None
+
     def test_the_reason_is_in_the_summary(self):
         assert "reason" in prepare(band, randn(12, 22)).summary()
 
@@ -368,11 +378,23 @@ class TestHybrid:
         low = lambda z: arrow(z.float()).double()
         x = randn(32, 59)
         P = bc.from_dense(dense_jac(arrow, x) != 0)
-        with pytest.raises(VerificationError):
+        with pytest.warns(VerificationInconclusive, match="pass that dtype as verify"):
             prepare(low, x, pattern=P, mode="hybrid").jacobian(x)
         p = prepare(low, x, pattern=P, mode="hybrid", verify=torch.float32)
         p.jacobian(x)
         assert p.mode == "hybrid" and p.status == "ok"
+
+    def test_a_tie_goes_to_the_plain_direction(self):
+        # A dense row over three rows holding one column each. The split needs
+        # two directions and so does plain reverse, which stays in one mode.
+        from src import _boolcsr as bc
+
+        f = lambda z: torch.cat([z.sum().reshape(1), z])
+        x = randn(3, 60)
+        P = bc.from_dense(dense_jac(f, x) != 0)
+        p = prepare(f, x, pattern=P, mode="hybrid")
+        assert p.mode == "reverse" and p.n_colors == 2
+        assert "against 2 for plain reverse" in p.reason
 
     def test_it_declines_when_plain_reverse_is_cheaper(self):
         # The split, 5 forward and 1 reverse, beats plain forward at 7. Plain
@@ -398,9 +420,12 @@ class TestHybrid:
         x = randn(8, 57)
         with pytest.raises(TraceMismatch):
             prepare(f, x, mode="hybrid")
+        # With the pattern given there is nothing to refuse, and the pattern is
+        # right, so the check can only report that it could not resolve it.
         p = prepare(f, x, pattern=bc.from_dense(dense_jac(arrow, x) != 0), mode="hybrid")
-        with pytest.raises(VerificationError):
+        with pytest.warns(VerificationInconclusive, match="two modes disagree"):
             p.jacobian(x)
+        assert p.status == "inconclusive"
 
     def test_complex_is_refused(self):
         from src import _boolcsr as bc
@@ -414,6 +439,18 @@ class TestHybrid:
                     pattern=bc.from_dense(dense_jac(arrow, x) != 0))
         assert p.mode == "hybrid"
         with pytest.raises(TypeError, match="complex output"):
+            p.jacobian(x)
+
+    @pytest.mark.parametrize("mode", ["forward", "hybrid"])
+    def test_settings_changed_after_preparing_are_still_checked(self, mode):
+        x = randn(32, 61)
+        p = prepare(arrow, x, mode=mode)
+        p.chunk = 0
+        with pytest.raises(ValueError, match="chunk"):
+            p.jacobian(x)
+        p.chunk = None
+        p.verify = "invalid"
+        with pytest.raises(ValueError, match="verify"):
             p.jacobian(x)
 
     def test_an_unknown_mode_still_names_the_choices(self):

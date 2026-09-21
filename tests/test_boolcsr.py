@@ -8,15 +8,21 @@ import scipy.sparse as sp
 from src import _boolcsr as bc
 
 
-def test_canary_300_way_accumulation():
-    # 300 contributions to one entry: bool ORs, an integer dtype would wrap.
-    # A dropped entry here is a silently wrong Jacobian.
-    n = 300
-    P = bc.from_pairs(np.zeros(n, dtype=np.int64), np.arange(n), shape=(1, n))
+def test_canary_256_way_accumulation():
+    # The product coloring builds, P transpose times P, where one entry takes a
+    # contribution from each of 256 rows. 256 is where an eight bit accumulator
+    # wraps to zero, and a dropped entry here is a silently wrong Jacobian.
+    k = 256
+    rows = np.repeat(np.arange(k), 2)
+    cols = np.tile(np.array([0, 1]), k)
+    P = bc.from_pairs(rows, cols, shape=(k, 2))
     A = bc.matmul(bc.transpose(P), P)
     assert A.dtype == np.bool_
-    assert A.nnz == n * n
-    assert A.toarray().all()
+    assert A.toarray().tolist() == [[True, True], [True, True]]
+
+    # What the same product does when the dtype is not bool, which is the point.
+    wrapped = sp.csr_array((np.ones(rows.size, np.uint8), (rows, cols)), shape=(k, 2))
+    assert (wrapped.T @ wrapped).toarray()[0, 0] == 0
 
 
 def test_canary_256_coincident_entries():

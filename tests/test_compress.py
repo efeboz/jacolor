@@ -202,4 +202,5 @@ class TestColoringFitsItsPattern:
         P = bc.from_dense([[1, 0], [0, 1]])
         c = cl.color_cols(P)
         P.data[:] = False
-        assert c.pattern.nnz == 2
+        # Not the stored count, which scipy keeps for entries it stores as False.
+        assert c.pattern.toarray().tolist() == [[True, False], [False, True]]

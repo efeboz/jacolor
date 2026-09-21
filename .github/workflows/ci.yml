@@ -120,6 +120,19 @@ jobs:
           assert S.shape == (10, 12) and S.nnz == 30
           assert len(jacolor.supported_ops()) > 30
 
+          # What a caller filters on, so it has to be there to filter on.
+          import warnings
+
+          for w in (jacolor.VerificationInconclusive, jacolor.TraceUnchecked):
+              assert issubclass(w, Warning), w
+          warnings.simplefilter("error", jacolor.TraceUnchecked)
+          try:
+              jacolor.sparsity(lambda z: z * 2, torch.zeros(4, dtype=torch.float16))
+              raise AssertionError("a float16 trace must report that it is unchecked")
+          except jacolor.TraceUnchecked:
+              pass
+          warnings.resetwarnings()
+
           # One dense row and one dense column: 3 directions split, 32 either way.
           def arrow(z):
               return torch.cat([z.sum().reshape(1), z[0] * z[1:]])

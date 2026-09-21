@@ -12,7 +12,8 @@ from .compress import decompress, seeds
 from .evaluate import VerificationError, VerificationInconclusive, jacobian
 from .interop import pattern, pattern_from_pairs, to_scipy
 from .analysis import Prepared, prepare
-from .trace import CustomBackward, TraceMismatch, UnsupportedOp, sparsity, supported_ops
+from .trace import (CustomBackward, TraceMismatch, TraceUnchecked, UnsupportedOp,
+                    sparsity, supported_ops)
 
 __version__ = "0.1.0.dev0"
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "UnsupportedOp",
     "CustomBackward",
     "TraceMismatch",
+    "TraceUnchecked",
     "VerificationError",
     "VerificationInconclusive",
     "Coloring",
