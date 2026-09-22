@@ -34,3 +34,9 @@ sources = { "src" = "jacolor" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# A test that leaves one of these unhandled is a test that does not know what it
+# checked. The ones that expect them say so with pytest.warns.
+filterwarnings = [
+    "error::src.evaluate.VerificationInconclusive",
+    "error::src.trace.TraceUnchecked",
+]
