@@ -4,7 +4,8 @@ import scipy.sparse as sp
 import torch
 
 from src import _boolcsr as bc
-from src.evaluate import jacobian
+from src.evaluate import VerificationInconclusive, jacobian
+from src.trace import TraceUnchecked
 from src.interop import pattern, pattern_from_pairs, to_scipy
 from src.analysis import prepare
 
@@ -108,10 +109,10 @@ class TestLowPrecision:
     @pytest.mark.parametrize("dt", HALF, ids=HALF_IDS)
     def test_to_scipy_promotes_half_precision(self, dt):
         x = torch.linspace(-1, 1, 12, dtype=dt)
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+        # Half precision cannot check the trace it came from, and bfloat16
+        # cannot resolve the result check either. Both are the library saying
+        # so, named here rather than filtered away.
+        with pytest.warns((TraceUnchecked, VerificationInconclusive)):
             J = jacobian(band, x)
         S = to_scipy(J)
         assert S.dtype == np.float32 and S.nnz == 30

@@ -21,6 +21,13 @@ def dense_jac(f, x):
 COARSE = (torch.float16, torch.bfloat16)
 
 
+def said(w):
+    # Which of the library's own warnings came out. A capture that looks at one
+    # category lets the other through, and the suite turns both into errors.
+    return sorted({type(m.message).__name__ for m in w
+                   if isinstance(m.message, (TraceUnchecked, VerificationInconclusive))})
+
+
 def traced(f, x):
     # The pattern, plus the fact that a coarse dtype leaves it unchecked.
     if x.dtype in COARSE:
@@ -347,9 +354,10 @@ class TestLowPrecisionDtypes:
         x = torch.linspace(-1, 1, 12, dtype=dt)
         P = traced(band, x)
         c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", VerificationInconclusive)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             J = jacobian(band, x, coloring=c)  # raises if the tolerance is too tight
+        assert said(w) == ["VerificationInconclusive"] * (dt == torch.bfloat16)
         tol = 8 * float(torch.finfo(dt).eps)
         want = dense_jac(band, x).to(F64)
         torch.testing.assert_close(J.to_dense().to(F64), want,
@@ -359,27 +367,30 @@ class TestLowPrecisionDtypes:
     def test_softmax_is_accepted_too(self, dt):
         f = lambda z: torch.softmax(z.reshape(2, 6), dim=1).reshape(-1)
         x = torch.linspace(-1, 1, 12, dtype=dt)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", VerificationInconclusive)
-            warnings.simplefilter("ignore", TraceUnchecked)
-            jacobian(f, x)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            jacobian(f, x)  # raises if the tolerance is too tight for the dtype
+        assert said(w) == ([] if dt not in COARSE else
+                           ["TraceUnchecked"] + ["VerificationInconclusive"]
+                           * (dt == torch.bfloat16))
 
 
 class TestVerificationOutcomes:
     """Agreeing inside a rounding allowance the size of the answer proves nothing."""
 
     # bfloat16 leaves room of about 0.55 of the terms summed, float16 about 0.07.
+    # float16 resolves the check and still cannot check its own trace.
     @pytest.mark.parametrize("dt,expect", [
-        (F64, False), (torch.float32, False), (torch.float16, False),
-        (torch.bfloat16, True),
+        (F64, []), (torch.float32, []),
+        (torch.float16, ["TraceUnchecked"]),
+        (torch.bfloat16, ["TraceUnchecked", "VerificationInconclusive"]),
     ], ids=["float64", "float32", "float16", "bfloat16"])
     def test_only_the_coarsest_dtype_is_inconclusive(self, dt, expect):
         x = torch.linspace(-1, 1, 12, dtype=dt)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             jacobian(band, x)
-        got = any(isinstance(m.message, VerificationInconclusive) for m in w)
-        assert got is expect
+        assert said(w) == expect
 
     def test_a_non_finite_derivative_is_inconclusive_not_a_pass(self):
         # sqrt has an infinite derivative at zero. Infinities cannot be compared
@@ -388,7 +399,7 @@ class TestVerificationOutcomes:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             J = jacobian(torch.sqrt, x)
-        assert any(isinstance(m.message, VerificationInconclusive) for m in w)
+        assert said(w) == ["VerificationInconclusive"]
         assert J._nnz() == 4  # the result is still returned, just unchecked
 
     def test_a_non_finite_input_with_a_finite_derivative_still_checks(self):
@@ -398,7 +409,7 @@ class TestVerificationOutcomes:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             jacobian(lambda z: z * 2.0, x)
-        assert not any(isinstance(m.message, VerificationInconclusive) for m in w)
+        assert said(w) == []
 
     def test_sums_that_overflow_are_inconclusive_not_a_pass(self):
         # Entries of 1e307 are finite, but thirty of them summed are not. A stale
@@ -457,7 +468,7 @@ class TestCancellationCannotHideAWrongPattern:
             warnings.simplefilter("always")
             J = p.jacobian(x)
         assert p.status == "inconclusive"
-        assert any(isinstance(m.message, VerificationInconclusive) for m in w)
+        assert said(w) == ["VerificationInconclusive"]
         assert int((J.to_dense() != 0).sum()) == 0  # and the answer really is wrong
 
     @pytest.mark.parametrize("mode", ["forward", "reverse"])
@@ -489,7 +500,7 @@ class TestMixedPrecisionTolerance:
             warnings.simplefilter("always")
             J = jacobian(f, x)
         # A tolerance that ignores the float32 arithmetic leaves this unchecked.
-        assert not [m for m in w if isinstance(m.message, VerificationInconclusive)]
+        assert said(w) == []
         torch.testing.assert_close(J.to_dense(), torch.func.jacrev(f)(x).to(F64),
                                    rtol=1e-6, atol=1e-6)
 
@@ -514,7 +525,7 @@ class TestMixedPrecisionTolerance:
             warnings.simplefilter("always")
             J = jacobian(self.LOW, x, coloring=c, verify=torch.float32)
         # Declared, so the check resolves rather than giving up on it.
-        assert not [m for m in w if isinstance(m.message, VerificationInconclusive)]
+        assert said(w) == []
         torch.testing.assert_close(J.to_dense(), torch.func.jacrev(self.LOW)(x),
                                    rtol=1e-6, atol=1e-6)
 
@@ -533,7 +544,7 @@ class TestMixedPrecisionTolerance:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             J = jacobian(f, x, coloring=c)
-        assert not [m for m in w if isinstance(m.message, VerificationInconclusive)]
+        assert said(w) == []
         torch.testing.assert_close(J.to_dense().to(F64), torch.func.jacrev(f)(x),
                                    rtol=1e-6, atol=1e-7)
 
@@ -625,9 +636,10 @@ class TestSaturationIsNotAWrongPattern:
         x = self.x(k, dt)
         P = sparsity(self.SM, x)
         c = cl.color_cols(P) if axis == "cols" else cl.color_rows(P)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", VerificationInconclusive)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             J = jacobian(self.SM, x, coloring=c)
+        assert said(w) in ([], ["VerificationInconclusive"])
         torch.testing.assert_close(J.to_dense(), torch.func.jacrev(self.SM)(x))
 
     @pytest.mark.parametrize("k", SPREAD, ids=[f"x0={k:g}" for k in SPREAD])
@@ -637,9 +649,9 @@ class TestSaturationIsNotAWrongPattern:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             jacobian(self.SM, x, coloring=c)
-        said = [m for m in w if isinstance(m.message, VerificationInconclusive)]
-        assert said, "a disagreement beyond rounding must not read as a pass"
-        assert "holds every entry of that line" in str(said[0].message)
+        assert said(w) == ["VerificationInconclusive"], \
+            "a disagreement beyond rounding must not read as a pass"
+        assert "holds every entry of that line" in str(w[-1].message)
 
     @pytest.mark.parametrize("k", SPREAD, ids=[f"x0={k:g}" for k in SPREAD])
     def test_a_missing_entry_is_still_caught_there(self, k):
