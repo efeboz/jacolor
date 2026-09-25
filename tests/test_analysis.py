@@ -484,3 +484,23 @@ class TestExplain:
     def test_it_repeats_the_reason_for_the_direction(self):
         p = prepare(band, randn(12, 53), mode="reverse")
         assert p.reason in p.explain()
+
+
+class TestRefine:
+    def test_fewer_colors_same_jacobian(self):
+        n = 10
+
+        def f(z):
+            u = z.reshape(n, n)
+            lap = sum(torch.roll(u, s, d) for s in (1, -1) for d in (0, 1)) - 4 * u
+            return (lap + torch.exp(u)).reshape(-1)
+
+        x = torch.rand(n * n, dtype=torch.float64)
+        plain, p = prepare(f, x), prepare(f, x, refine=True)
+        assert p.n_colors < plain.n_colors and "refine took it" in p.reason
+        torch.testing.assert_close(p.jacobian(x).to_dense(), torch.func.jacrev(f)(x))
+        assert p.status == "ok"
+
+    def test_refine_must_be_a_bool(self):
+        with pytest.raises(ValueError, match="refine"):
+            prepare(lambda z: z * 2, torch.rand(3, dtype=torch.float64), refine="yes")

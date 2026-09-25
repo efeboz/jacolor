@@ -7,7 +7,7 @@ set of ops and refuses anything it cannot vouch for (see README).
 """
 
 from . import propagate
-from .coloring import ORDERS, Coloring, color_cols, color_rows
+from .coloring import ORDERS, Coloring, color_cols, color_rows, refine
 from .compress import decompress, seeds
 from .evaluate import VerificationError, VerificationInconclusive, jacobian
 from .interop import pattern, pattern_from_pairs, to_scipy
@@ -34,6 +34,7 @@ __all__ = [
     "Coloring",
     "color_cols",
     "color_rows",
+    "refine",
     "decompress",
     "seeds",
     "propagate",

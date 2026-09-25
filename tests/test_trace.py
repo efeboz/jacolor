@@ -11,6 +11,7 @@ from src.trace import (CustomBackward, TraceMismatch, TraceUnchecked, Unsupporte
 
 F64 = torch.float64
 CONV = torch.nn.functional.conv2d
+F_ = torch.nn.functional
 
 
 def dense_jac(f, x):
@@ -133,6 +134,166 @@ def test_pointwise_contains_the_jacobian(name, f):
     assert_contains(sparsity(f, x), f, x)
 
 
+IDX = torch.tensor([0, 3, 3, 4])
+PAD = torch.nn.functional.pad
+
+
+def unbound(z):
+    a, b, c = z.reshape(3, 4)
+    return a * b - c
+
+
+def slice_write(z):
+    r = torch.zeros_like(z)
+    r[1:-1] = z[1:-1] * 2
+    return r
+
+
+def repeated_put(z):
+    r = z.clone()
+    r[torch.tensor([5, 5])] = z[:2] * 3
+    return r
+
+
+def row_write(z):
+    r = torch.zeros(3, 4, dtype=F64)
+    r[1] = z[:4]
+    return r.reshape(-1)
+
+
+def boundary_writes(z):
+    r = torch.zeros(12, dtype=F64)
+    r[0] = z[0] - 1
+    r[1:-1] = z[:-2] - 2 * z[1:-1] + z[2:]
+    r[-1] = z[-1] ** 2
+    return r
+
+# Every output element is one input element or none, so these are held to exact.
+MOVES = [
+    ("roll", lambda z: torch.roll(z, 2)),
+    ("flip", lambda z: z.flip(0)),
+    ("constant pad and crop", lambda z: PAD(z, (1, 2)) + PAD(z, (-1, 4))),
+    ("2d pad with a value", lambda z: PAD(z.reshape(3, 4), (1, 1, 1, 1), value=2.0).reshape(-1)),
+    ("circular pad", lambda z: PAD(z.reshape(1, 3, 4), (1, 1), mode="circular").reshape(-1)),
+    ("reflect pad", lambda z: PAD(z.reshape(1, 3, 4), (1, 1), mode="reflect").reshape(-1)),
+    ("x[idx]", lambda z: z[IDX]),
+    ("x[rows, cols]", lambda z: z.reshape(3, 4)[torch.tensor([0, 2]), torch.tensor([1, 3])]),
+    ("x[:, idx]", lambda z: z.reshape(3, 4)[:, torch.tensor([0, 2])].reshape(-1)),
+    ("x[constant mask]", lambda z: z[torch.arange(12) % 3 == 0]),
+    ("index_select", lambda z: z.index_select(0, IDX)),
+    ("gather", lambda z: z.reshape(3, 4).gather(1, torch.tensor([[0, 1], [2, 2], [3, 0]])).reshape(-1)),
+    ("repeat and tile", lambda z: torch.cat([z.repeat(2), z.reshape(3, 4).tile(1, 2).reshape(-1)])),
+    ("unfold", lambda z: z.unfold(0, 3, 2).reshape(-1)),
+    ("diagonal", lambda z: torch.diagonal(z.reshape(3, 4), 1)),
+    ("split and chunk", lambda z: torch.cat(z.split([5, 7])[::-1]) * torch.cat(z.chunk(3)[::-1])),
+    ("unbind", unbound),
+    ("slice write into a buffer", slice_write),
+    # Export writes one row as a where over a mask built from literals, which is
+    # read, since nothing can change it between evaluations.
+    ("row write into a buffer", row_write),
+    ("boundary writes", boundary_writes),
+    ("tril", lambda z: torch.tril(z.reshape(3, 4)).reshape(-1)),
+    ("masked_fill with a constant mask", lambda z: z.masked_fill(torch.arange(12) % 2 == 0, 0.0)),
+    ("detach", lambda z: z * z.detach() + z.detach().sum()),
+]
+
+
+@pytest.mark.parametrize("name,f", MOVES, ids=[m[0] for m in MOVES])
+def test_moves_are_exact(name, f):
+    x = torch.randn(12, dtype=F64)
+    P = sparsity(f, x)
+    assert_contains(P, f, x)
+    assert_exact(P, f, x)
+
+
+# A derivative that depends on values, or rules that are conservative on
+# purpose. Held to containment.
+VALUED = [
+    ("comparisons into where", lambda z: torch.where((z > 0) & (z <= 1) | (z == 0.5), z, -z)),
+    ("where on two tracked", lambda z: torch.where(z[:6] > z[6:], z[:6], z[6:])),
+    ("sign and rounding", lambda z: z.sign() * z + z.floor() + z.round()),
+    ("argmax as a value", lambda z: z.argmax().reshape(1).double() + z[:1]),
+    ("mask from a comparison", lambda z: z * (z > 0).double() + z.masked_fill(z > 0.5, 0.0)),
+    ("clamp", lambda z: z.clamp(-1, 1) + z.clamp_min(0) + z.clamp(min=torch.zeros(12, dtype=F64))),
+    ("maximum and minimum", lambda z: torch.maximum(z, z.flip(0)) + torch.minimum(z, torch.zeros(12, dtype=F64))),
+    ("elementary", lambda z: (z / 4).log1p() + z.expm1() + z.tan() + (z / 4).asin() + z.cosh()
+                             + z.erf() + z.abs().log2() + (z / 4).atanh()),
+    ("atan2 and pow", lambda z: torch.atan2(z, z.flip(0) + 2) + z.abs().pow(z) + 2.0 ** z),
+    ("activations", lambda z: F_.gelu(z) + F_.silu(z) + F_.softplus(z) + F_.elu(z) + F_.leaky_relu(z)),
+    ("bmm", lambda z: torch.bmm(z.reshape(2, 2, 3), z.reshape(2, 3, 2)).reshape(-1)),
+    ("einsum", lambda z: torch.einsum("bij,bj->bi", z.reshape(2, 2, 3), z[:6].reshape(2, 3)).reshape(-1)),
+    # Along different dims of one shape, so neither prefix covers the other's.
+    ("cumsum", lambda z: (z.reshape(3, 4).cumsum(1) * z.reshape(3, 4).cumsum(0)).reshape(-1)),
+    ("cumprod", lambda z: z.reshape(3, 4).cumprod(0).reshape(-1)),
+    ("prod amax logsumexp", lambda z: z.reshape(3, 4).prod(1) + z.reshape(3, 4).amax(1)
+                                      + z.reshape(3, 4).logsumexp(1)),
+    ("max over a dim", lambda z: z.reshape(3, 4).max(1).values + z.reshape(3, 4).min(0).values[:3]),
+    ("var and norm", lambda z: z.reshape(3, 4).std(1) + torch.linalg.vector_norm(z.reshape(3, 4), dim=1)),
+    ("cross", lambda z: torch.linalg.cross(z[:3], z[3:6])),
+    ("index_add", lambda z: z[:5].index_add(0, IDX, z[4:8])),
+    ("scatter_add", lambda z: z.reshape(3, 4).scatter_add(
+        1, torch.tensor([[0, 0], [3, 1], [2, 2]]), z[:6].reshape(3, 2)).reshape(-1)),
+    ("scatter", lambda z: z[:6].scatter(0, torch.tensor([1, 4]), z[6:8])),
+    ("put with a repeated index", repeated_put),
+    ("sort", lambda z: z.reshape(3, 4).sort(1).values.reshape(-1)),
+    ("stable descending sort", lambda z: torch.sort(z, stable=True, descending=True).values),
+    ("topk", lambda z: z.reshape(3, 4).topk(2, dim=0).values.reshape(-1)),
+    ("kthvalue and median", lambda z: z.reshape(3, 4).kthvalue(2).values + z.reshape(3, 4).median(1).values),
+    ("cummax and cummin", lambda z: (z.reshape(3, 4).cummax(1).values
+                                     * z.reshape(3, 4).cummin(0).values).reshape(-1)),
+    ("logcumsumexp", lambda z: torch.logcumsumexp(z.reshape(3, 4), 0).reshape(-1)),
+    ("layer_norm", lambda z: F_.layer_norm(z.reshape(1, 3, 4), (3, 4)).reshape(-1)),
+    ("layer_norm with a tracked weight", lambda z: F_.layer_norm(z[:8].reshape(2, 4), (4,), z[8:]).reshape(-1)),
+    ("scatter_reduce", lambda z: z[4:7].scatter_reduce(0, torch.tensor([0, 1, 1, 2]), z[:4], "prod",
+                                                      include_self=False)),
+    ("index_reduce", lambda z: z[:6].reshape(2, 3).index_reduce(
+        1, torch.tensor([2, 0]), z[6:10].reshape(2, 2), "amax").reshape(-1)),
+]
+
+
+@pytest.mark.parametrize("name,f", VALUED, ids=[v[0] for v in VALUED])
+def test_value_dependent_ops_contain_the_jacobian(name, f):
+    x = torch.randn(12, dtype=F64)
+    assert_contains(sparsity(f, x), f, x)
+
+
+# An index read off x moves with x, so a pattern taken at one point goes stale.
+TRACKED_INDEX = [
+    ("mask", lambda z: z[z > 0]),
+    ("gather", lambda z: z.gather(0, z.argmax().reshape(1))),
+    ("put", lambda z: torch.zeros(12, dtype=F64).index_put((z.argmax().reshape(1),), z[:1])),
+    ("scatter", lambda z: torch.zeros(12, dtype=F64).scatter_add(0, z.argmin().reshape(1), z[:1])),
+]
+
+
+def test_agreeing_on_nan_is_not_a_check():
+    # Traced, f is sqrt(z), which is diagonal. Run, it is sqrt(z + z.sum()),
+    # which is dense. At -1 both give nan everywhere, values and derivative, so
+    # they agree without the check having seen anything.
+    def f(z):
+        if torch.compiler.is_compiling():
+            return z.sqrt()
+        return (z + z.sum()).sqrt()
+
+    with pytest.warns(TraceUnchecked, match="not finite"):
+        sparsity(f, -torch.ones(3, dtype=F64))
+
+
+def test_a_captured_mask_is_not_read():
+    # Only a mask built from literals may be read. A captured tensor can be
+    # changed between evaluations, so where keeps both branches.
+    # Through an op, since a captured tensor on its own is an input to the graph.
+    mask = torch.arange(6) % 2 == 0
+    P = sparsity(lambda z: torch.where(~mask, z[:6], z[6:]), torch.randn(12, dtype=F64))
+    assert (P.toarray().sum(1) == 2).all()
+
+
+@pytest.mark.parametrize("name,f", TRACKED_INDEX, ids=[t[0] for t in TRACKED_INDEX])
+def test_an_index_computed_from_x_is_refused(name, f):
+    with pytest.raises(UnsupportedOp, match="index computed from x"):
+        sparsity(f, torch.randn(12, dtype=F64))
+
+
 class TestCouplings:
     def test_softmax(self):
         f = lambda z: torch.softmax(z.reshape(2, 3), dim=1).reshape(-1)
@@ -143,9 +304,11 @@ class TestCouplings:
 
     # x.sum() and torch.sum(x) export as sum(x, []), where an empty list means
     # every dim. Read as "no dims" it gave one row per element for a scalar.
+    # dim=None exports as sum(x, None) and means the same.
     @pytest.mark.parametrize("f", [lambda z: z.reshape(2, 3).sum(1),
                                    lambda z: z.reshape(2, 3).sum().reshape(1),
-                                   lambda z: torch.sum(z).reshape(1)])
+                                   lambda z: torch.sum(z).reshape(1),
+                                   lambda z: z.sum(dim=None, keepdim=True)])
     def test_sum(self, f):
         x = torch.randn(6, dtype=F64)
         P = sparsity(f, x)
@@ -208,19 +371,28 @@ class TestRefusals:
 
     def test_unsupported_op_names_the_op_and_the_line(self):
         def f(z):
-            return torch.cumsum(z, 0)
+            return torch.lgamma(z)
 
         with pytest.raises(UnsupportedOp) as e:
             sparsity(f, torch.randn(4, dtype=F64))
         msg = str(e.value)
-        assert "aten.cumsum" in msg
+        assert "aten.lgamma" in msg
         # The exact line comes from a private torch hook. Without it the message
         # still names the op, it just cannot point at the caller.
         import torch.fx.proxy as fxp
 
         if not hasattr(fxp, "_STACK_TRACE_ANCHORS"):
             pytest.skip("this torch has no stack trace anchor registry")
-        assert "test_trace.py" in msg and "torch.cumsum(z, 0)" in msg
+        assert "test_trace.py" in msg and "torch.lgamma(z)" in msg
+
+    def test_a_cast_goes_through(self):
+        # Export puts an assertion ahead of the cast, which has to be ignored
+        # rather than refused for the cast to reach its own rule.
+        f = lambda z: z.float().double() * z
+        x = torch.randn(4, dtype=F64)
+        P = sparsity(f, x)
+        assert_contains(P, f, x)
+        assert_exact(P, f, x)
 
     def test_anchor_registry_is_left_as_found(self):
         # The exact-line trace uses a private torch registry. Tracing, refused or
@@ -232,7 +404,7 @@ class TestRefusals:
         before = set(fxp._STACK_TRACE_ANCHORS)
 
         def g(z):
-            return torch.cumsum(z, 0)
+            return torch.lgamma(z)
 
         with pytest.raises(UnsupportedOp):
             sparsity(g, torch.randn(4, dtype=F64))
@@ -613,7 +785,8 @@ def test_supported_ops_is_a_sorted_table():
     assert len(names) == len(set(names))
     assert "addmm.default" in names and "mm.default" in names
     assert set(k for _, k in table) <= {
-        "row map", "pointwise", "reduction", "slice coupling", "coupling"
+        "row map", "pointwise", "zero derivative", "reduction", "scan",
+        "slice coupling", "coupling", "scatter"
     }
 
 
@@ -630,7 +803,7 @@ def test_readme_table_matches_the_registry():
         want[kind].add(name)
     readme = pathlib.Path(__file__).resolve().parents[1] / "README.md"
     got = collections.defaultdict(set)
-    for kind, ops in re.findall(r"^\| (row map|pointwise|reduction|slice coupling|coupling) \| (.+?) \|$",
+    for kind, ops in re.findall(r"^\| (row map|pointwise|zero derivative|reduction|scan|slice coupling|coupling|scatter) \| (.+?) \|$",
                                 readme.read_text(), re.M):
         got[kind] |= {o.strip() for o in ops.split(",")}
     assert got, (

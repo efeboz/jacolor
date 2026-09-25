@@ -27,13 +27,13 @@ from . import _boolcsr as bc
 TIGHTNESS = {
     "gather": "exact",
     "cat": "exact",
-    "stack": "exact",
     "reduce_sum": "structural",
     "pointwise": "structural",
     "couple": "conservative",
     "mm": "conservative",
+    "bmm": "conservative",
     "slice_couple": "conservative",
-    "index_couple": "conservative",
+    "prefix": "structural",
     "conv2d": "conservative",
 }
 
@@ -46,12 +46,12 @@ __all__ = [
     "couple",
     "pointwise",
     "cat",
-    "stack",
     "reduce_sum",
     "slice_couple",
-    "index_couple",
+    "prefix",
     "conv2d",
     "mm",
+    "bmm",
 ]
 
 
@@ -92,7 +92,14 @@ def gather(P, src):
 
     Exact. Covers reshape, permute, transpose, expand, slicing and concrete
     indexing, since each output element is one input element with derivative 1.
+
+    A src of -1 means no input element, as for padding, and gives an empty row.
+    Checked here, since numpy would read -1 as the last row.
     """
+    src = np.asarray(src, dtype=np.int64)
+    if src.size and src.min() < 0:
+        P = bc.vstack([P, bc.from_pairs([], [], (1, P.shape[1]))])
+        src = np.where(src < 0, P.shape[0] - 1, src)
     return bc.gather(P, src)
 
 
@@ -165,50 +172,65 @@ def mm(Pa, Pb, m, k, n):
     return union(*parts)
 
 
-def _join(Ps, shapes, dim, combine):
-    # Stack every input's rows, then read them back in the joined order. The
-    # trick is joining the index arrays: numpy works out the interleaving.
-    offs = np.cumsum([0] + [_n(s) for s in shapes])
-    arrs = [np.arange(_n(s), dtype=np.int64).reshape(s) + o for s, o in zip(shapes, offs)]
-    return gather(bc.vstack(Ps), combine(arrs, axis=dim).reshape(-1))
+def bmm(Pa, Pb, b, m, k, n):
+    """Batched matrix product (b, m, k) @ (b, k, n), either operand tracked or both.
+
+    mm within each batch, and batches never mix. Conservative for the same
+    reason mm is: the untracked operand's zeros are never read.
+    """
+    if Pa is None and Pb is None:
+        raise ValueError("bmm needs at least one tracked operand")
+    parts = []
+    if Pa is not None:
+        parts.append(gather(reduce_sum(Pa, (b, m, k), (2,)), reduce_src((b, m, n), (2,))))
+    if Pb is not None:
+        parts.append(gather(reduce_sum(Pb, (b, k, n), (1,)), reduce_src((b, m, n), (1,))))
+    return union(*parts)
 
 
 def cat(Ps, shapes, dim=0):
     """Concatenate along dim. A row map, so exact."""
-    return _join(Ps, shapes, dim, np.concatenate)
+    # Stack every input's rows, then read them back in the joined order. The
+    # trick is joining the index arrays: numpy works out the interleaving.
+    offs = np.cumsum([0] + [_n(s) for s in shapes])
+    arrs = [np.arange(_n(s), dtype=np.int64).reshape(s) + o for s, o in zip(shapes, offs)]
+    return gather(bc.vstack(Ps), np.concatenate(arrs, axis=dim).reshape(-1))
 
 
-def stack(Ps, shapes, dim=0):
-    """Stack along a new axis dim. A row map, so exact."""
-    return _join(Ps, shapes, dim, np.stack)
-
-
-def slice_couple(P, shape, dims):
+def slice_couple(P, shape, dims, out_shape=None):
     """Every output element depends on the whole input slice along dims.
 
-    Shape preserving. Covers ops whose output is a value-dependent function of
-    the slice it sits in: softmax, sort, topk, cummax, logcumsumexp, normalize.
-    Conservative, and for sort badly so: the true Jacobian is a permutation and
-    this claims the whole block.
+    Covers ops whose output is a value-dependent function of the slice it sits
+    in: softmax, sort, layer_norm. Conservative, and for sort badly so: the true
+    Jacobian is a permutation and this claims the whole block.
+
+    out_shape differs from shape only along dims, as topk's does, and defaults
+    to shape.
     """
     # Union each slice once, then hand every element its slice's row. Pairing
     # elements directly would cost the slice size squared.
-    return gather(reduce_sum(P, shape, dims), reduce_src(shape, dims))
+    return gather(reduce_sum(P, shape, dims), reduce_src(out_shape or shape, dims))
 
 
-def index_couple(P, shape, dim, n_out):
-    """Index along dim with a tracked index, as in x[argmax(x)].
+def prefix(P, shape, dim):
+    """Running union along dim: element i draws on elements 0 to i of its line.
 
-    The index is not known at pattern time, so each output element depends on
-    the whole input slice along dim. The index itself is integer and carries no
-    derivative, so it contributes nothing. Conservative.
+    cumsum and cumprod. Structural, as a sum is, and cumprod also loses entries
+    where a factor is zero, which a union cannot see. Built by doubling: after
+    the step with shift s every element holds the union of the 2s before it,
+    so log2 of the line length steps suffice rather than a quadratic pairing.
     """
-    if len(shape) == 0:  # a scalar has one line along its only axis
-        return gather(reduce_sum(P, shape, (0,)), np.zeros(n_out, dtype=np.int64))
+    if len(shape) == 0:
+        return P
     dim %= len(shape)
-    out_shape = tuple(shape[:dim]) + (n_out,) + tuple(shape[dim + 1:])
-    # Input and output agree on every axis but dim, so they share slice ids.
-    return gather(reduce_sum(P, shape, (dim,)), reduce_src(out_shape, (dim,)))
+    L, stride = shape[dim], _n(shape[dim + 1:])
+    at = np.arange(_n(shape), dtype=np.int64)
+    coord = (at // stride) % L if L else at
+    s = 1
+    while s < L:
+        P = union(P, gather(P, np.where(coord >= s, at - s * stride, -1)))
+        s *= 2
+    return P
 
 
 def _pair(v):

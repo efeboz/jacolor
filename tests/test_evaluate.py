@@ -399,7 +399,9 @@ class TestVerificationOutcomes:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             J = jacobian(torch.sqrt, x)
-        assert said(w) == ["VerificationInconclusive"]
+        # The trace's own derivative check meets the same infinity, so it cannot
+        # vouch for the pattern either.
+        assert said(w) == ["TraceUnchecked", "VerificationInconclusive"]
         assert J._nnz() == 4  # the result is still returned, just unchecked
 
     def test_a_non_finite_input_with_a_finite_derivative_still_checks(self):

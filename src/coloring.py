@@ -15,11 +15,22 @@ import numpy as np
 
 from . import _boolcsr as bc
 
-__all__ = ["Coloring", "color_cols", "color_rows", "graph_estimate", "MAX_EDGES",
-           "ORDERS"]
+__all__ = ["Coloring", "color_cols", "color_rows", "refine", "graph_estimate",
+           "MAX_EDGES", "ORDERS"]
 
-# Orderings tried by default. The one giving the fewest colors wins.
-ORDERS = ("natural", "lf", "sl")
+# Orderings tried by default. The one giving the fewest colors wins. "iterated"
+# starts from the best of those before it, so it goes last.
+ORDERS = ("natural", "lf", "sl", "iterated")
+
+# Rounds of iterated greedy, and how many may pass without a gain before it stops.
+_ROUNDS = 30
+_PATIENCE = 10
+
+# Moves tabu search may spend trying to reach each lower count.
+_TABU_MOVES = 20_000
+
+# Memory tabu search may hold: two int32 tables, active lines by colors.
+_TABU_BYTES = 1 << 28
 
 # Above this many columns the pure-Python greedy loop gets slow.
 _SLOW_ABOVE = 10_000
@@ -158,6 +169,33 @@ def _smallest_last(indptr, indices, deg):
     return out
 
 
+def _iterated(A, colors):
+    # Culberson's iterated greedy. Greedy over an order that keeps each color
+    # class together never needs more colors than there were classes, so
+    # reordering the classes can only keep or lower the count. Reversed, smallest
+    # first and shuffled with a fixed seed, in turn.
+    if colors.size == 0:
+        return colors
+    rng = np.random.default_rng(0)
+    best = cur = colors
+    idle = 0
+    for r in range(_ROUNDS):
+        k = int(cur.max()) + 1
+        order = (np.arange(k)[::-1], np.argsort(np.bincount(cur, minlength=k), kind="stable"),
+                 rng.permutation(k))[r % 3]
+        rank = np.empty(k, dtype=np.int64)
+        rank[order] = np.arange(k)
+        perm = np.argsort(rank[cur], kind="stable").astype(np.int64)
+        cur = _greedy(A.indptr, A.indices, perm, colors.size)
+        if cur.max() < best.max():
+            best, idle = cur, 0
+        else:
+            idle += 1
+            if idle >= _PATIENCE:
+                break
+    return best
+
+
 def _perm(name, A, deg):
     if name == "natural":
         return np.arange(deg.size, dtype=np.int64)
@@ -192,10 +230,14 @@ def _best(P, orders):
 
     best = None
     for name in orders:
-        colors = _greedy(A.indptr, A.indices, _perm(name, A, deg), n)
+        if name == "iterated":
+            start = best[0] if best else _greedy(A.indptr, A.indices, _perm("natural", A, deg), n)
+            colors = _iterated(A, start)
+        else:
+            colors = _greedy(A.indptr, A.indices, _perm(name, A, deg), n)
         k = int(colors.max()) + 1 if n else 0
         if best is None or k < best[1]:
-            best = (colors, k, lb, name)
+            best = (colors, k, lb, f"{best[3]}+iterated" if name == "iterated" and best else name)
         if best[1] <= lb:  # the bound is reached, so no ordering can do better
             break
     return best
@@ -209,3 +251,88 @@ def color_cols(P, orders=ORDERS):
 def color_rows(P, orders=ORDERS):
     """Color the rows of pattern P for reverse-mode seeding."""
     return Coloring(*_best(bc.transpose(P), orders), "rows", P)
+
+
+def _tabu(A, colors, k, moves, seed):
+    """Look for a coloring with k colors, starting from colors. None if not found.
+
+    TabuCol: count the conflicting pairs, and move one conflicting vertex at a
+    time to the color that lowers the count most, forbidding a vertex to return
+    to a color it just left for a while so the search cannot circle. A move that
+    beats the best count so far is allowed even if forbidden.
+    """
+    rng = np.random.default_rng(seed)
+    n = colors.size
+    ip, ix = A.indptr, A.indices
+    rows = np.repeat(np.arange(n), np.diff(ip))
+    edge = rows != ix  # the diagonal is every column meeting itself
+    c = np.where(colors < k, colors, rng.integers(0, k, n)).astype(np.int64)
+    # g[v, j] counts the neighbours of v colored j.
+    g = np.zeros((n, k), dtype=np.int32)
+    np.add.at(g, (rows[edge], c[ix[edge]]), 1)
+    conf = int(g[np.arange(n), c].sum()) // 2
+    until = np.zeros((n, k), dtype=np.int32)
+    best = conf
+    big = np.iinfo(np.int32).max // 4
+    for it in range(moves):
+        if conf == 0:
+            return c
+        bad = np.flatnonzero(g[np.arange(n), c] > 0)
+        d = g[bad] - g[bad, c[bad]][:, None]
+        d[np.arange(bad.size), c[bad]] = big
+        d = np.where((until[bad] <= it) | (conf + d < best), d, big)
+        low = d.min()
+        if low >= big:
+            continue
+        i, j = np.argwhere(d == low)[rng.integers(int((d == low).sum()))]
+        v, old = bad[i], c[bad[i]]
+        nb = ix[ip[v]:ip[v + 1]]
+        nb = nb[nb != v]
+        g[nb, old] -= 1
+        g[nb, j] += 1
+        c[v] = j
+        conf += int(low)
+        until[v, old] = it + int(0.6 * bad.size) + int(rng.integers(0, 10))
+        best = min(best, conf)
+    return c if conf == 0 else None
+
+
+def refine(coloring, moves=_TABU_MOVES):
+    """Try to use fewer colors than greedy found, by tabu search.
+
+    Greedy colors each line once and never looks back, which on a periodic grid
+    can leave it well above what is possible. This searches for one color fewer
+    at a time, until it reaches the lower bound or a count it cannot reach
+    within moves. Each attempt that fails costs the full budget, so this is for
+    a coloring that will be used many times.
+
+    Returns a new Coloring, or the same one when nothing was gained, or when the
+    search would not fit in memory: its graph under MAX_EDGES, and its tables
+    under 256 MB. The result goes through the same checks as any coloring, so
+    the search can cost time but never a wrong Jacobian.
+    """
+    if coloring.n_colors <= coloring.lower_bound:  # nothing below it to find
+        return coloring
+    P = coloring.pattern
+    L = P if coloring.axis == "cols" else bc.transpose(P)
+    if graph_estimate(L) > MAX_EDGES:
+        return coloring
+    A = bc.matmul(bc.transpose(L), L)
+    # A line that shares no row with another never conflicts. It keeps color 0
+    # and stays out of the search, and out of its tables.
+    active = np.flatnonzero(_degrees(A) > 0)
+    if 8 * active.size * (coloring.n_colors - 1) > _TABU_BYTES:
+        return coloring
+    A = A[active][:, active]
+    colors, k = coloring.colors[active], coloring.n_colors
+    while k - 1 >= max(coloring.lower_bound, 1):
+        got = _tabu(A, colors, k - 1, moves, seed=k)
+        if got is None:
+            break
+        colors, k = got, k - 1
+    if k == coloring.n_colors:
+        return coloring
+    full = np.zeros(coloring.colors.size, dtype=np.int64)
+    full[active] = colors
+    return Coloring(full, k, coloring.lower_bound, f"{coloring.order}+tabu",
+                    coloring.axis, P)

@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from src import _boolcsr as bc, coloring as cl
 
@@ -160,7 +161,8 @@ class TestStopsAtTheBound:
         P = bc.from_dense(np.array([[1, 1, 0], [0, 1, 1], [1, 0, 1]], dtype=bool))
         c = cl.color_cols(P)
         assert c.n_colors == 3 and c.lower_bound == 2
-        assert len(calls) == len(cl.ORDERS)
+        # One call per static ordering, then iterated rounds until it gives up.
+        assert len(calls) == len(cl.ORDERS) - 1 + cl._PATIENCE
 
     def test_stopping_early_never_costs_a_color(self):
         # Whatever it stops at must still be the best any single ordering gives.
@@ -170,3 +172,62 @@ class TestStopsAtTheBound:
             P = rand_pattern(rng, m, n, rng.uniform(0.1, 0.6))
             each = [cl.color_cols(P, orders=(o,)).n_colors for o in cl.ORDERS]
             assert cl.color_cols(P).n_colors == min(each)
+
+
+def torus(n):
+    # The 5-point stencil on an n by n periodic grid.
+    i, j = np.divmod(np.arange(n * n), n)
+    rows = np.repeat(np.arange(n * n), 5)
+    cols = np.stack([i * n + j, ((i + 1) % n) * n + j, ((i - 1) % n) * n + j,
+                     i * n + (j + 1) % n, i * n + (j - 1) % n], 1).ravel()
+    return bc.from_pairs(rows, cols, (n * n, n * n))
+
+
+class TestRefine:
+    def test_reaches_the_optimum_greedy_misses(self):
+        # A 10 by 10 torus colors with 5, the lower bound, where greedy needs more.
+        c = cl.color_cols(torus(10))
+        assert c.n_colors > 5
+        r = cl.refine(c)
+        assert r.n_colors == r.lower_bound == 5 and r.order.endswith("+tabu")
+
+    def test_leaves_a_coloring_at_its_bound_alone(self, monkeypatch):
+        # Without building a graph, which for a dense row can be far too large.
+        P = bc.from_dense(np.ones((1, 50), dtype=bool))
+        c = cl.Coloring(np.arange(50), 50, 50, "natural", "cols", P)
+        monkeypatch.setattr(bc, "matmul", lambda *a: pytest.fail("built the graph"))
+        assert cl.refine(c) is c
+
+    def test_keeps_to_the_graph_budget(self, monkeypatch):
+        c = cl.color_cols(torus(10))
+        monkeypatch.setattr(cl, "MAX_EDGES", cl.graph_estimate(torus(10)) - 1)
+        assert cl.refine(c) is c
+
+    def test_tables_count_only_lines_that_can_conflict(self, monkeypatch):
+        # 100 torus columns among 20000 empty ones. The tables fit the active
+        # columns exactly, so counting the empty ones would give up.
+        P = sp.csr_array(sp.hstack([torus(10), sp.csr_array((100, 20_000), dtype=bool)]))
+        c = cl.color_cols(bc.check(P))
+        monkeypatch.setattr(cl, "_TABU_BYTES", 8 * 100 * (c.n_colors - 1))
+        r = cl.refine(c)
+        assert r.n_colors == 5 and (r.colors[100:] == 0).all()
+        monkeypatch.setattr(cl, "_TABU_BYTES", 8 * 100 * (c.n_colors - 1) - 1)
+        assert cl.refine(c) is c
+
+    def test_rows_too(self):
+        c = cl.color_rows(bc.transpose(torus(10)))
+        assert cl.refine(c).n_colors == 5
+
+    def test_iterated_beats_every_static_order_on_a_torus(self):
+        P = torus(10)
+        static = min(cl.color_cols(P, orders=(o,)).n_colors for o in ("natural", "lf", "sl"))
+        c = cl.color_cols(P)
+        assert c.n_colors < static and c.order.endswith("+iterated")
+
+    def test_iterated_never_costs_a_color(self):
+        rng = np.random.default_rng(7)
+        for _ in range(30):
+            m, n = rng.integers(2, 20, size=2)
+            P = rand_pattern(rng, m, n, rng.uniform(0.1, 0.5))
+            static = min(cl.color_cols(P, orders=(o,)).n_colors for o in ("natural", "lf", "sl"))
+            assert cl.color_cols(P).n_colors <= static

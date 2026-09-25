@@ -74,4 +74,5 @@ def decompress(B, coloring):
     ri, ci, line = _index(P, coloring, B.device)
     vals = B[ri, line] if coloring.axis == "cols" else B[line, ci]
     # Canonical CSR has no repeats, so coalesce() cannot merge two entries here.
-    return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
+    return torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape,
+                                check_invariants=False).coalesce()

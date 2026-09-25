@@ -299,7 +299,8 @@ def _assemble(f, x, coloring, chunk, verify, index=None):
     _real(primal, "output")
     status = (_verify(f, x, ri, ci, vals, P, coloring.axis, primal, back, _floor(verify))
               if verify else "skipped")
-    J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
+    J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape,
+                                check_invariants=False).coalesce()
     return J, primal, status
 
 

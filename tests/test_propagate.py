@@ -323,13 +323,6 @@ class TestJoin:
         assert_sound(P, f, 6)
         assert_exact(P, f, 6)
 
-    def test_stack(self):
-        f = lambda x: torch.stack([torch.sin(x[:3]), x[3:]], dim=0).reshape(-1)
-        P = pr.stack([pr.gather(bc.eye(6), [0, 1, 2]), pr.gather(bc.eye(6), [3, 4, 5])],
-                     [(3,), (3,)], 0)
-        assert_sound(P, f, 6)
-        assert_exact(P, f, 6)
-
 
 class TestSliceCouple:
     def test_softmax_is_dense_within_its_slice(self):
@@ -356,40 +349,13 @@ class TestSliceCouple:
         assert P.toarray().all()
 
 
-class TestIndexCouple:
-    def test_tracked_index_gather(self):
-        # The index comes from the data, so any input element could feed any
-        # output element. The true Jacobian is two one-hot rows.
-        f = lambda x: x[torch.argsort(x)[:2]]
-        P = pr.index_couple(bc.eye(6), (6,), 0, 2)
-        assert_sound(P, f, 6)
-        assert P.toarray().all()
-        J = dense_jac(f, torch.randn(6, generator=torch.Generator().manual_seed(2), dtype=F64))
-        assert (J != 0).sum() == 2
-
-    def test_argmax_scalar_index(self):
-        f = lambda x: (x[x.argmax()] * x)[:1]
-        P = pr.index_couple(bc.eye(5), (5,), 0, 1)
-        assert_sound(P, f, 5)
-
-    def test_keeps_other_dims_separate(self):
-        # Indexing along dim 1 must not couple row 0 to row 1.
-        f = lambda x: torch.take_along_dim(
-            x.reshape(2, 3), x.reshape(2, 3).argsort(dim=1)[:, :2], dim=1
-        ).reshape(-1)
-        P = pr.index_couple(bc.eye(6), (2, 3), 1, 2)
-        assert_sound(P, f, 6)
-        assert P.nnz == 12  # 2 outputs x 3 inputs x 2 rows, not 4 x 6
-
-
-def brute_group(shape, dims, out_shape=None, skip=None):
+def brute_group(shape, dims):
     # (a, b) set iff output element a and input element b agree on every axis
     # that is not coupled.
-    out_shape = out_shape or shape
-    free = [d for d in range(len(shape)) if d not in (skip if skip is not None else dims)]
-    M = np.zeros((int(np.prod(out_shape)), int(np.prod(shape))), dtype=bool)
+    free = [d for d in range(len(shape)) if d not in dims]
+    M = np.zeros((int(np.prod(shape)), int(np.prod(shape))), dtype=bool)
     for a in range(M.shape[0]):
-        ia = np.unravel_index(a, out_shape)
+        ia = np.unravel_index(a, shape)
         for b in range(M.shape[1]):
             ib = np.unravel_index(b, shape)
             M[a, b] = all(ia[d] == ib[d] for d in free)
@@ -397,7 +363,7 @@ def brute_group(shape, dims, out_shape=None, skip=None):
 
 
 class TestCouplingIncidence:
-    """Both couplings are built by argsort arithmetic. Check against loops."""
+    """The slice coupling is built by argsort arithmetic. Check against loops."""
 
     @pytest.mark.parametrize("seed", range(25))
     def test_slice_couple(self, seed):
@@ -408,16 +374,6 @@ class TestCouplingIncidence:
         got = pr.slice_couple(bc.eye(int(np.prod(shape))), shape, dims).toarray()
         assert (got == brute_group(shape, dims)).all()
 
-    @pytest.mark.parametrize("seed", range(25))
-    def test_index_couple(self, seed):
-        rng = np.random.default_rng(seed)
-        nd = int(rng.integers(1, 4))
-        shape = tuple(int(rng.integers(1, 4)) for _ in range(nd))
-        dim = int(rng.integers(0, nd))
-        n_out = int(rng.integers(1, 4))
-        out_shape = shape[:dim] + (n_out,) + shape[dim + 1:]
-        got = pr.index_couple(bc.eye(int(np.prod(shape))), shape, dim, n_out).toarray()
-        assert (got == brute_group(shape, (dim,), out_shape, skip=(dim,))).all()
 
 
 # --- randomized soundness sweep ----------------------------------------------
@@ -442,9 +398,6 @@ def _candidates(shape):
         if N > 2:
             out.append((lambda v: v[1:],
                         lambda P, s, N=N: pr.gather(P, np.arange(1, N)), (N - 1,)))
-            k = max(1, N // 2)
-            out.append((lambda v, k=k: v[torch.argsort(v)[:k]],
-                        lambda P, s, k=k: pr.index_couple(P, s, 0, k), (k,)))
         if N <= 8:
             # The appended tail must NOT share the head's pattern, or a rule
             # that reorders rows would go unnoticed.
@@ -657,7 +610,7 @@ class TestCancellationThroughReduce:
         # The incoming pattern is exact and sum's own Jacobian is all ones, yet
         # x + (-x) has a zero Jacobian. This is why reduce_sum is structural.
         f = lambda x: torch.stack([x, -x]).sum(0)
-        P = pr.reduce_sum(pr.stack([bc.eye(3), bc.eye(3)], [(3,), (3,)], 0), (2, 3), (0,))
+        P = pr.reduce_sum(pr.cat([bc.eye(3), bc.eye(3)], [(3,), (3,)], 0), (2, 3), (0,))
         assert_sound(P, f, 3)
         assert not (dense_jac(f, torch.randn(3, dtype=F64)) != 0).any()
         assert P.nnz == 3
@@ -688,18 +641,6 @@ class TestDegenerateShapes:
     def test_slice_couple_rows(self, shape, dims):
         assert pr.slice_couple(empty_rows(numel(shape)), shape, dims).shape[0] == numel(shape)
 
-    @pytest.mark.parametrize(
-        "shape,dim,n_out", [((6,), 0, 0), ((2, 3), 1, 0), ((0, 3), 1, 2), ((2, 3), 0, 4)]
-    )
-    def test_index_couple_rows(self, shape, dim, n_out):
-        want = torch.zeros(shape).index_select(dim, torch.zeros(n_out, dtype=torch.long)).numel()
-        assert pr.index_couple(empty_rows(numel(shape)), shape, dim, n_out).shape[0] == want
-
-    def test_index_couple_on_a_scalar(self):
-        # A scalar has one line along its only axis, so every output draws on it.
-        P = pr.index_couple(bc.eye(1), (), 0, 3)
-        assert P.shape == (3, 1) and P.toarray().all()
-
     def test_slice_couple_on_a_scalar(self):
         assert pr.slice_couple(bc.eye(1), (), (0,)).shape == (1, 1)
 
@@ -727,9 +668,4 @@ class TestCouplingCost:
     def test_slice_couple_is_linear(self, pairs):
         P = pr.gather(bc.eye(1), np.zeros(1000, dtype=np.int64))
         assert pr.slice_couple(P, (1000,), (0,)).nnz == 1000
-        assert max(pairs) <= 1000
-
-    def test_index_couple_is_linear(self, pairs):
-        P = pr.gather(bc.eye(1), np.zeros(1000, dtype=np.int64))
-        assert pr.index_couple(P, (1000,), 0, 1000).nnz == 1000
         assert max(pairs) <= 1000

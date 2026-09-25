@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from . import _boolcsr as bc
-from .coloring import MAX_EDGES, color_cols, color_rows, graph_estimate
+from .coloring import MAX_EDGES, color_cols, color_rows, graph_estimate, refine as _refine
 from .compress import _block, _index
 from .evaluate import _assemble, _check_chunk, _check_verify, _floor, _pull, _push, _verify
 from .interop import pattern as as_pattern
@@ -290,7 +290,8 @@ def _assemble_split(f, x, split, index, chunk, verify):
     # forward derivative. That is what catches the two modes disagreeing.
     status = (_verify(f, x, ri, ci, vals, P, "cols", primal, None, _floor(verify))
               if verify else "skipped")
-    J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape).coalesce()
+    J = torch.sparse_coo_tensor(torch.stack([ri, ci]), vals, P.shape,
+                                check_invariants=False).coalesce()
     return J, primal, status
 
 
@@ -332,7 +333,21 @@ def _plan(P):
     return best, f"{name}, {best.n_colors} colors against {alt.n_colors} for {alt_name}"
 
 
-def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True):
+def _refined(p):
+    # Refine whatever was chosen. The choice itself was made on greedy counts.
+    before = p.n_colors
+    if p.split:
+        s = p.split
+        p.split = _Split(s.full, s.rows, _refine(s.rest), _refine(s.dense))
+        p.coloring = p.split.rest
+    else:
+        p.coloring = _refine(p.coloring)
+    p.reason += (f". refine took it from {before} to {p.n_colors} colors" if p.n_colors < before
+                 else f". refine left it at {before} colors")
+    return p
+
+
+def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True, refine=False):
     """Trace and color f once, for repeated evaluation at inputs shaped like x.
 
     mode picks the direction. "forward" colors columns and seeds tangents,
@@ -357,6 +372,11 @@ def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True):
     derivative check. With pattern= nothing refuses it, and the evaluation check
     reports the result unchecked, since the pattern is not what is wrong.
     Inputs and outputs must be real.
+
+    refine searches for a coloring with fewer colors than greedy found, by tabu
+    search, which on periodic grids often saves a third of the passes. It costs
+    up to a few seconds once, at preparation, and is applied after the direction
+    is chosen.
     """
     if mode not in ("auto", "forward", "reverse", "hybrid"):
         raise ValueError(
@@ -364,6 +384,8 @@ def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True):
         )
     _check_chunk(chunk)  # before tracing, so a bad value costs nothing
     _check_verify(verify)
+    if not isinstance(refine, bool):
+        raise ValueError(f"refine must be True or False, got {refine!r}")
     _real(x, "input")
     P = sparsity(f, x) if pattern is None else as_pattern(pattern)
     if P.shape[1] != x.numel():
@@ -374,18 +396,21 @@ def prepare(f, x, mode="auto", pattern=None, chunk=None, verify=True):
         split, plain, why = _split_plan(P)
         sig = (tuple(x.shape), x.dtype, x.device)
         if split is not None:
-            return Prepared(f, split.rest, sig, chunk, verify, why, split)
+            p = Prepared(f, split.rest, sig, chunk, verify, why, split)
+            return _refined(p) if refine else p
         if plain is None:  # declined before any plain direction was colored
             plain, choice = _plan(P)
             why = f"{choice}. {why}"
         else:
             name = "forward" if plain.axis == "cols" else "reverse"
             why = f"{name}, {plain.n_colors} colors. {why}"
-        return Prepared(f, plain, sig, chunk, verify, why)
+        p = Prepared(f, plain, sig, chunk, verify, why)
+        return _refined(p) if refine else p
     if mode == "auto":
         coloring, reason = _plan(P)
     else:
         coloring = color_cols(P) if mode == "forward" else color_rows(P)
         reason = f"{mode}, as asked, {coloring.n_colors} colors"
     sig = (tuple(x.shape), x.dtype, x.device)
-    return Prepared(f, coloring, sig, chunk, verify, reason)
+    p = Prepared(f, coloring, sig, chunk, verify, reason)
+    return _refined(p) if refine else p
