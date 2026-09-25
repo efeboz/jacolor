@@ -8,7 +8,7 @@ colors, run one pass per color and decompress the result. Julia has this in
 SparseConnectivityTracer.jl and SparseMatrixColorings.jl, and JAX has asdex,
 while PyTorch has had no equivalent.
 
-**Status: pre-alpha, small op set.** The pipeline works end to end and every
+**Status: pre-alpha.** The pipeline works end to end and every
 result is checked against autograd, though only the operators listed below have
 rules and anything outside them is refused rather than guessed.
 
@@ -44,6 +44,11 @@ prepare takes mode ("forward", "reverse", "auto" or "hybrid"), chunk to cap how
 many colors are in flight, and verify. If you already know the structure you can
 pass it with pattern= and skip tracing altogether, and that accepts a dense
 array or tensor, a scipy matrix, or a jacolor pattern.
+
+refine=True spends longer on the coloring, once, to save passes on every
+evaluation after. On a 2D Brusselator it took the colors from 8 to 6 with the
+Laplacian written through F.pad, and from 10 to 7 with torch.roll, in under a
+second at 16 by 16. refine() does the same to a coloring you hold yourself.
 
 On "auto" it plans before it colors. The memory a direction would need and the
 fewest colors it could possibly use both follow from the pattern alone, so it
@@ -136,11 +141,14 @@ pattern of [1, 0] lets both columns share a color and recovery returns
 
 | kind | ops |
 |---|---|
-| row map | cat.default, clone.default, expand.default, permute.default, select.int, slice.Tensor, squeeze.dim, squeeze.dims, unsqueeze.default, view.default |
-| pointwise | abs.default, add.Tensor, cos.default, div.Tensor, exp.default, log.default, mul.Tensor, neg.default, pow.Tensor_Scalar, reciprocal.default, relu.default, rsqrt.default, sigmoid.default, sin.default, sqrt.default, sub.Tensor, tanh.default, where.self |
-| reduction | mean.default, mean.dim, sum.default, sum.dim_IntList |
-| slice coupling | _log_softmax.default, _softmax.default |
-| coupling | addmm.default, convolution.default, mm.default |
+| row map | alias.default, cat.default, clone.default, constant_pad_nd.default, copy.default, diagonal.default, expand.default, flip.default, gather.default, index.Tensor, index_select.default, permute.default, repeat.default, select.int, select_scatter.default, slice.Tensor, slice_scatter.default, split.Tensor, split_with_sizes.default, squeeze.default, squeeze.dim, squeeze.dims, unbind.int, unfold.default, unsqueeze.default, view.default |
+| pointwise | _to_copy.default, abs.default, acos.default, acosh.default, add.Tensor, asin.default, asinh.default, atan.default, atan2.default, atanh.default, clamp.Tensor, clamp.default, cos.default, cosh.default, div.Tensor, elu.default, erf.default, exp.default, exp2.default, expm1.default, fmax.default, fmin.default, fmod.Scalar, fmod.Tensor, gelu.default, hardtanh.default, hypot.default, leaky_relu.default, log.default, log10.default, log1p.default, log2.default, maximum.default, minimum.default, mul.Tensor, neg.default, pow.Scalar, pow.Tensor_Scalar, pow.Tensor_Tensor, reciprocal.default, relu.default, remainder.Scalar, remainder.Tensor, rsqrt.default, sigmoid.default, sin.default, sinh.default, sqrt.default, sub.Tensor, tan.default, tanh.default, where.self |
+| zero derivative | argmax.default, argmin.default, bitwise_and.Tensor, bitwise_not.default, bitwise_or.Tensor, bitwise_xor.Tensor, ceil.default, detach.default, empty_like.default, eq.Scalar, eq.Tensor, floor.default, full_like.default, ge.Scalar, ge.Tensor, gt.Scalar, gt.Tensor, le.Scalar, le.Tensor, logical_and.default, logical_not.default, logical_or.default, lt.Scalar, lt.Tensor, ne.Scalar, ne.Tensor, round.default, sign.default, trunc.default |
+| reduction | amax.default, amin.default, kthvalue.default, linalg_vector_norm.default, max.dim, mean.default, mean.dim, median.default, median.dim, min.dim, prod.default, prod.dim_int, sum.default, sum.dim_IntList, var.correction |
+| scan | cummax.default, cummin.default, cumprod.default, cumsum.default, logcumsumexp.default |
+| slice coupling | _log_softmax.default, _softmax.default, native_layer_norm.default, sort.default, sort.stable, topk.default |
+| coupling | addmm.default, bmm.default, convolution.default, mm.default |
+| scatter | index_put.default, index_reduce.default, scatter.src, scatter_add.default, scatter_reduce.two |
 
 nn.Linear is addmm, so ordinary dense layers work. supported_ops() returns the
 same table, and a test keeps this list from drifting away from it.
@@ -164,9 +172,12 @@ same table, and a test keeps this list from drifting away from it.
   untested.
 - An op with no rule, a custom autograd.Function on the derivative path, a
   traced program that disagrees with f, and control flow on the values of x are
-  all refused. A dtype cast inside f has no rule yet, so such an f needs
-  pattern=.
-- Indexing with a tensor index, batched matmul and padding have no rules yet.
+  all refused. So is an index computed from x, as in x[x.argmax()] or x[x > 0],
+  since the entries it picks move with x. Comparisons and argmax carry no
+  derivative but stay tracked for exactly this reason.
+- sort, topk, median, kthvalue, cummax and cummin pick elements by value, so
+  their rules claim the whole line each pick could come from. That is sound,
+  and loose by as much as the line is long.
 - CI runs the suite on Python 3.10 to 3.13 against the current torch, with and
   without the numba extra, and once against the declared floor of torch 2.6.0
   with scipy 1.14.1. It also smoke tests the built wheel, hybrid included, from
@@ -177,8 +188,12 @@ same table, and a test keeps this list from drifting away from it.
 - Patterns are always boolean CSR, since integer dtypes wrap on accumulation and
   drop entries without saying so.
 - The coloring tries three orderings, natural, largest-first and smallest-last,
-  and keeps whichever uses fewest colors. Incidence-degree is left out because it
-  is dynamic and does not fit the static-permutation kernel.
+  then iterated greedy from the best of them, which colors again with each color
+  class kept together and so can only keep or lower the count. Incidence-degree
+  is left out because it is dynamic and does not fit the static-permutation
+  kernel. refine goes further by tabu search, one color fewer at a time, until
+  it reaches the lower bound or a budget of moves. On a 10 by 10 periodic grid
+  greedy needs 8 where 5 is possible, and refine finds the 5.
 - The lower bound is the densest line of the pattern, which any coloring has to
   spend a color on. Reaching it settles the question for that direction and
   summary() reports it as optimal, though it says nothing about the other
@@ -187,10 +202,19 @@ same table, and a test keeps this list from drifting away from it.
   bound of its own, the sum of its two halves, and gets under the
   single-direction bound by not being a single direction.
 - Propagation is one construction throughout, a left-multiply by a boolean
-  incidence matrix. Row maps (reshape, permute, slicing, broadcast, cat, stack)
-  are exact, while couplings take a union over a slice, where sums are
-  structural and exact unless terms cancel, and matmul, conv, softmax, sort and
-  tracked indices are conservative on purpose.
+  incidence matrix. Row maps (reshape, permute, slicing, broadcast, cat, stack,
+  padding and indexing with a fixed index) are exact, while couplings take a
+  union over a slice, where sums are structural and exact unless terms cancel,
+  and matmul, conv and softmax are conservative on purpose. A put or scatter
+  keeps what it overwrites, since a repeated index has no defined winner in
+  torch and the union of every writer is the sound answer.
+- Rules never read a value that could change between evaluations. The one
+  exception is a mask built from literals in the graph alone, with no input,
+  parameter, captured tensor or random op behind it, which is how export writes
+  r[1] = v. A where over such a mask takes each element from its one branch, so
+  writes into a buffer stay exact.
+- detach is kept through export rather than lowered to alias, so the traced
+  program has f's derivative and the pattern leaves the detached term out.
 - The trace is checked against f in values and in one directional derivative, to
   a tolerance that follows the dtype. A float32 matmul and its traced form sum
   in a different order and differ in their last bits, so a float64 bound would
