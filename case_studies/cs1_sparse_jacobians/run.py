@@ -1,11 +1,16 @@
 """Case study 1: Broyden tridiagonal Jacobian, jacolor against dense AD.
 
-Run from the repository root:
-
-    python -m case_studies.cs1_sparse_jacobians.run --out /tmp/jacolor-cs1/results.json
+    python -m case_studies.cs1_sparse_jacobians.run --out /tmp/jacolor-cs1/results.json  # repo root
+    python run.py --out /tmp/jacolor-cs1/results.json                                    # this folder
 
 Prints one row per size as it finishes and writes every measurement, check and
 the environment to a JSON file that plot.py reads. See CASE_STUDY_1.md.
+
+Columns: prep is prepare() in a warmed process, 1st the first jacobian() (it
+builds cached indices). jacolor, jacfwd, jacrev and ref (handwritten analytic
+COO) are medians in ms. jacolor includes assembly and verification. speedup is
+the faster dense method over jacolor. COO and dense are the size of the
+Jacobian output, * where dense was calculated rather than allocated.
 """
 
 import argparse
@@ -24,8 +29,10 @@ import scipy
 import torch
 from torch.utils.benchmark import Timer
 
-from src import TraceUnchecked, VerificationInconclusive, prepare
-from src import __version__ as jacolor_version
+# Run as a file (python run.py), only this directory is on the path, not the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src import TraceUnchecked, VerificationInconclusive, prepare  # noqa: E402
+from src import __version__ as jacolor_version  # noqa: E402
 
 DTYPE = torch.float64
 SIZES = [64, 256, 1024, 2048, 10000, 100000]
@@ -84,7 +91,8 @@ def timed(stmt, min_run_time, **env):
 def environment(seed):
     def sh(*cmd):
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+            return subprocess.run(cmd, capture_output=True, text=True, check=True,
+                                  cwd=Path(__file__).resolve().parents[2]).stdout.strip()
         except (OSError, subprocess.CalledProcessError):
             return None
 
@@ -234,7 +242,8 @@ def row(r):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sizes", type=int, nargs="+", default=SIZES)
     ap.add_argument("--out", type=Path, default=Path("/tmp/jacolor-cs1/results.json"))
     ap.add_argument("--seed", type=int, default=0)
@@ -257,9 +266,7 @@ def main(argv=None):
 
     print(f"Broyden tridiagonal, {env['dtype']}, CPU, 1 thread | torch {env['torch']}, "
           f"numba {env['numba']} | {env['cpu']}")
-    print(f"reuse check (one analysis, two inputs, n={reuse['n']}): "
-          f"{'ok' if reuse['ok'] else 'FAIL ' + '; '.join(reuse['problems'])}")
-    print("times in ms (blocked_autorange median), storage of the Jacobian output in bytes\n")
+    print("times in ms, storage in bytes; column definitions: --help\n")
     print(HEAD)
     print("-" * len(HEAD))
 
@@ -273,14 +280,11 @@ def main(argv=None):
     dense_wins = [r["n"] for r in results if r.get("speedup_vs_best_dense", 2) < 1]
     skipped = [r["n"] for r in results if "dense_skipped" in r]
     print("-" * len(HEAD))
-    print("prep: prepare() in a warmed process. 1st: first jacobian(), builds cached indices. "
-          "jacolor timings include assembly and verification.")
-    print("ref: handwritten analytic COO, a lower reference. speedup: faster of jacfwd/jacrev "
-          "over jacolor. *: calculated, not allocated.")
-    if skipped:
-        print(f"dense AD skipped for n in {skipped} (output over {args.dense_limit_mib:g} MiB).")
-    print(f"dense AD faster at n in {dense_wins}." if dense_wins
-          else "jacolor faster than dense AD at every size where both ran.")
+    print(f"dense AD faster at n = {', '.join(map(str, dense_wins)) or 'none'}"
+          + (f"; not run at n = {', '.join(map(str, skipped))} "
+             f"(output over {args.dense_limit_mib:g} MiB)" if skipped else ""))
+    if not reuse["ok"]:
+        print("FAIL reuse check: " + "; ".join(reuse["problems"]))
     for r in failed:
         print(f"FAIL n={r['n']}: " + "; ".join(r["problems"]))
 
@@ -294,8 +298,8 @@ def main(argv=None):
            "results": results}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out, indent=1))
-    print(f"\nvalidation {'passed' if out['validation']['ok'] else 'FAILED'}; "
-          f"wrote {args.out}")
+    print(f"validation {'passed' if out['validation']['ok'] else 'FAILED'} "
+          f"(reuse check + {len(results)} sizes); results in {args.out}")
     return 0 if out["validation"]["ok"] else 1
 
 

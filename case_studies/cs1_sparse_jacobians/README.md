@@ -9,13 +9,20 @@ function itself. The design and measurement procedure are in [CASE_STUDY_1.md](.
 
 ```bash
 python -m case_studies.cs1_sparse_jacobians.run --out /tmp/jacolor-cs1/results.json
+python -m case_studies.cs1_sparse_jacobians.validate --out /tmp/jacolor-cs1/validation.json
 python -m case_studies.cs1_sparse_jacobians.plot /tmp/jacolor-cs1/results.json --out /tmp/jacolor-cs1/figures
 ```
 
+For a quick live demonstration, `python demo.py` from this folder shows detection, coloring,
+correctness, speed, scaling and the safety check in about three seconds.
+
 The runner prints a row for each size as it completes, saves all measurements and the
 environment to JSON, and exits with a non-zero status if any correctness check fails. The
-plotting script reads that file and writes `scaling` (runtime and output storage against `n`)
-and `sparsity` (the detected pattern of a 12-variable instance, coloured by colour group).
+validation script compares the Jacobian with independent references and wrong patterns (below).
+The plotting script reads the benchmark file and writes `scaling` (runtime and output storage
+against `n`) and `sparsity` (the detected pattern of a 12-variable instance, coloured by colour
+group); `--slides` sizes the figure for a 16:9 slide. A ten-minute talk built on these results,
+with slides and speaker notes, is in [talk/](talk/).
 
 ## Results
 
@@ -39,6 +46,19 @@ colours, the lowest number possible for this pattern. Its values matched the ana
 diagonals, and where dense AD was run, they agreed with both dense Jacobians to
 `rtol=1e-10, atol=1e-12`. Its built-in verification reported `ok` at every size. The
 interquartile range of each timing was no more than 1.4% of its median.
+
+`validate.py` checks correctness against references that do not depend on jacolor or on
+autograd. One analysis per size, prepared at `x = -1`, is reused at seven points, including
+`x = 1.5`, where the diagonal is exactly zero, and five random points. Up to `n = 100000`, the
+detected pattern equals the analytic one with no missing or extra entries, and for `n <= 64`
+it equals the nonzeros of a Jacobian derived symbolically by SymPy. The values differ from the
+analytic formula and from SymPy by at most 1.8e-15, and from `jacfwd` and `jacrev` by exactly
+zero. Central finite differences agree to 6e-10 relative error, which is their own rounding
+error (`f` is quadratic, so they have no truncation error). Above `n = 2048` the comparison is
+`J v` against a difference along random `v`. When the upper diagonal is removed from the
+pattern, verification raises `VerificationError` naming the missing entry; without
+verification the same call returns a Jacobian that is off by up to 2. A pattern with two extra
+diagonals needs 5 colours and still gives exact values.
 
 Dense AD is faster for small problems. At `n = 64`, `jacrev` takes 0.088 ms, against 0.403 ms
 for jacolor, because jacolor's fixed cost of sparse assembly and a verification pass is larger

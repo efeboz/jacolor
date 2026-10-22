@@ -1,6 +1,7 @@
 """Figures for case study 1, from the JSON that run.py saved.
 
     python -m case_studies.cs1_sparse_jacobians.plot /tmp/jacolor-cs1/results.json --out /tmp/jacolor-cs1/figures
+    python plot.py /tmp/jacolor-cs1/results.json --out /tmp/jacolor-cs1/figures  # from this folder
 
 Writes scaling.{png,pdf} (runtime and output storage against n) and
 sparsity.{png,pdf} (the detected pattern on a small instance, by color).
@@ -38,15 +39,16 @@ def series(results, key):
     return n, med, np.clip(lo, 0, None), np.clip(hi, 0, None)
 
 
-def scaling(data, out):
+def scaling(data, out, slides=False):
     res = data["results"]
-    fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(9, 4.2), constrained_layout=True)
+    fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(7.2, 3.9) if slides else (9, 4.2),
+                                     constrained_layout=True)
 
     for key, label, color, style in (
-            ("sparse", "jacolor, repeated evaluation", BLUE, "-o"),
-            ("jacfwd", "torch.func.jacfwd (dense)", ORANGE, "-s"),
-            ("jacrev", "torch.func.jacrev (dense)", AQUA, "-^"),
-            ("analytic", "handwritten analytic COO", GRAY, ":D")):
+            ("sparse", "jacolor, evaluation", BLUE, "-o"),
+            ("jacfwd", "jacfwd (dense)", ORANGE, "-s"),
+            ("jacrev", "jacrev (dense)", AQUA, "-^"),
+            ("analytic", "analytic COO, by hand", GRAY, ":D")):
         n, med, lo, hi = series(res, key)
         ax_t.errorbar(n, med, yerr=[lo, hi], fmt=style, color=color, label=label,
                       capsize=2, elinewidth=1, markersize=4)
@@ -63,11 +65,11 @@ def scaling(data, out):
     coo = np.array([s["sparse_coo_bytes"] for _, s in st]) / 2 ** 20
     dense = np.array([s["dense_bytes"] for _, s in st]) / 2 ** 20
     alloc = np.array([s["dense_allocated"] for _, s in st])
-    ax_m.plot(n, coo, "-o", color=BLUE, label="sparse COO (values + indices)")
+    ax_m.plot(n, coo, "-o", color=BLUE, label="sparse COO")
     ax_m.plot(n, dense, "--", color=ORANGE, linewidth=1)
     ax_m.plot(n[alloc], dense[alloc], "s", color=ORANGE, label="dense, allocated")
     ax_m.plot(n[~alloc], dense[~alloc], "s", color=ORANGE, mfc="white",
-              label="dense, calculated (n·n·8 B)")
+              label="dense, calculated")
     limit = data["settings"]["dense_limit_mib"]
     ax_m.axhline(limit, color=MUTED, linewidth=0.8, linestyle=":")
     ax_m.annotate(f"{limit:g} MiB dense limit", (n.min(), limit), xytext=(0, 3),
@@ -77,10 +79,11 @@ def scaling(data, out):
     ax_m.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), ncols=2)
 
     env = data["environment"]
-    fig.text(0.01, -0.06, f"Broyden tridiagonal, x = -1, float64, CPU, 1 thread. "
-             f"{env['cpu']}, torch {env['torch']}. Medians over blocked_autorange, "
-             "bars span the interquartile range. Dense AD omitted above the limit.",
-             fontsize=7, color=MUTED)
+    if not slides:  # on a slide the frame says this
+        fig.text(0.01, -0.06, f"Broyden tridiagonal, x = -1, float64, CPU, 1 thread. "
+                 f"{env['cpu']}, torch {env['torch']}. Medians over blocked_autorange, "
+                 "bars span the interquartile range. Dense AD omitted above the limit.",
+                 fontsize=7, color=MUTED)
     save(fig, out / "scaling")
 
 
@@ -118,10 +121,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("results", type=Path)
     ap.add_argument("--out", type=Path, default=Path("/tmp/jacolor-cs1/figures"))
+    ap.add_argument("--slides", action="store_true",
+                    help="larger text on a smaller canvas and no caption, for a 16:9 slide")
     args = ap.parse_args(argv)
+    if args.slides:
+        plt.rcParams.update({"font.size": 10, "axes.titlesize": 11, "axes.labelsize": 10,
+                             "legend.fontsize": 8.5})
     data = json.loads(args.results.read_text())
     args.out.mkdir(parents=True, exist_ok=True)
-    scaling(data, args.out)
+    scaling(data, args.out, slides=args.slides)
     sparsity(data, args.out)
 
 
