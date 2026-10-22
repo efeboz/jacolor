@@ -2,15 +2,17 @@
 
 Jacobian sparsity detection and coloring for PyTorch.
 
-A sparse Jacobian rarely needs one AD pass per column. If you detect the
-sparsity pattern first you can group the columns that never share a row into
-colors, run one pass per color and decompress the result. Julia has this in
-SparseConnectivityTracer.jl and SparseMatrixColorings.jl, and JAX has asdex,
-while PyTorch has had no equivalent.
+When a Jacobian is sparse, columns that never share a row can be grouped into
+one color and differentiated together, so the full matrix costs one AD pass per
+color instead of one per column. jacolor detects the sparsity pattern from the
+function, colors it, runs the batched passes and decompresses the result into a
+sparse tensor. Julia provides this through SparseConnectivityTracer.jl and
+SparseMatrixColorings.jl, and JAX through asdex; PyTorch has no built-in
+equivalent.
 
-**Status: pre-alpha.** The pipeline works end to end and every
-result is checked against autograd, though only the operators listed below have
-rules and anything outside them is refused rather than guessed.
+**Status: pre-alpha.** The pipeline works end to end and every result is checked
+against autograd. Only the operators listed below have rules, and a function
+that uses anything else is refused.
 
 ## Example
 
@@ -27,7 +29,7 @@ J = jacobian(f, x)                           # sparse (10, 12), 3 AD passes not 
 torch.allclose(J.to_dense(), torch.func.jacrev(f)(x))   # True
 ```
 
-For a solver loop, trace and color once and evaluate many times:
+In a solver loop, trace and color once, then evaluate many times:
 
 ```python
 from jacolor import prepare, to_scipy
@@ -36,106 +38,62 @@ p = prepare(residual, x0)                    # traces and colors once
 print(p)                                     # Prepared(forward, 400x400, ...)
 
 for _ in range(steps):
-    r, J = p.value_and_jacobian(x)           # both, which is what a solver wants
+    r, J = p.value_and_jacobian(x)
     x = x - solve(to_scipy(J), r)            # any scipy sparse solver
 ```
 
-prepare takes mode ("forward", "reverse", "auto" or "hybrid"), chunk to cap how
-many colors are in flight, and verify. If you already know the structure you can
-pass it with pattern= and skip tracing altogether, and that accepts a dense
-array or tensor, a scipy matrix, or a jacolor pattern.
+`prepare` accepts `mode` (`"forward"`, `"reverse"`, `"auto"` or `"hybrid"`),
+`chunk` to cap how many colors are evaluated at once and so bound peak memory,
+and `verify`. A known structure can be passed as `pattern=` (a dense array or
+tensor, a scipy matrix or a jacolor pattern) to skip tracing. `refine=True`
+searches longer for a smaller coloring at preparation time; on a 16 by 16
+Brusselator it reduced the colors from 8 to 6 in under a second.
 
-refine=True spends longer on the coloring, once, to save passes on every
-evaluation after. On a 2D Brusselator it took the colors from 8 to 6 with the
-Laplacian written through F.pad, and from 10 to 7 with torch.roll, in under a
-second at 16 by 16. refine() does the same to a coloring you hold yourself.
+With `mode="auto"`, the memory each direction would need and the fewest colors
+it could use are computed from the pattern before coloring. A direction that
+does not fit or cannot beat the other is skipped, and the choice is reported in
+`p.reason`.
 
-On "auto" it plans before it colors. The memory a direction would need and the
-fewest colors it could possibly use both follow from the pattern alone, so it
-skips a direction that cannot be built as well as one whose lower bound already
-rules it out, and it reports the choice in reason.
+A single dense row (a global constraint) or dense column (a shared parameter)
+forces one color per line in both plain directions. `mode="hybrid"` recovers the
+densest rows in reverse and the rest forward. On a 32 by 32 arrow pattern, plain
+forward and reverse each need 32 directions and the split needs 3, a count that
+stays at 3 at n = 64. The split is taken only when it uses fewer directions than
+both plain modes. Fewer directions do not guarantee less time: at n = 256 on the
+same pattern, dense `jacrev` (0.16 ms) beat both plain forward (0.29 ms) and the
+split (0.31 ms), because each pass there is cheap. `p.explain()` describes the
+pattern, the bound, the chosen direction and whether a split would help.
 
-### When neither direction compresses
+## Guarantees
 
-A global constraint shows up as one dense row and a shared parameter as one
-dense column, and either of them on its own forces a color per line, which
-leaves forward and reverse equally stuck. Setting those rows aside and
-recovering them in reverse lets the rest compress as usual:
+The pattern is valid for inputs with the same shape, dtype and device on which
+`f` follows the same code path. A prepared analysis rejects inputs that differ
+in shape, dtype or device.
 
-```python
-p = prepare(residual, x0, mode="hybrid")
-print(p.explain())
-```
-
-On a 32 by 32 arrow, one dense row and one dense column over a diagonal, plain
-forward and plain reverse each need 32 directions. The split needs 3, two
-forward for the rest and one reverse for the dense row, and it stays at 3 when
-the problem grows to 64, because the cost follows the coupling rather than the
-size. prepare takes the split only when it beats both plain modes, and otherwise
-says so and falls back to the cheaper of the two.
-
-Those 3 directions count AD passes rather than time. The passes on this arrow
-are batched and each one is trivial, so at n = 256 plain forward evaluates in
-0.29 ms against 0.31 ms for the split, while dense jacrev beats both at 0.16 ms.
-Trading passes for structure pays off once a pass is expensive, which is the
-situation this is built for rather than the one measured here.
-
-explain() gives the same facts in words, covering what the pattern costs, which
-lines force the bound, why a direction was chosen and whether a split would
-help. Everything it says comes off the detected pattern, where an entry means
-the derivative may be nonzero rather than that it certainly is.
-
-## What it promises
-
-The pattern holds for inputs of the same shape, dtype and device on which f
-takes the same path through its code, so it says nothing about how f behaves
-elsewhere.
-
-A prepared analysis is checked against the input it was built for, and every
-result is checked against one directional derivative from autograd. That check
-samples one point in one direction, so agreement counts as evidence rather than
-proof, and where rounding or overflow leaves it unable to tell it says so
-instead of reporting a pass.
-
-When the two disagree by more than rounding accounts for, the check stops short
-of blaming the pattern. Both sides come from f's own derivative and carry its
-rounding, and a function like a saturated softmax computes its entries through
-cancellation that leaves them far less exact than their size suggests. So it
-asks a structural question instead, whether f's derivative holds anything on
-that line which the pattern leaves out. It looks by bisecting what the pattern
-leaves out, one AD pass per step and within a budget, and reads the last entry
-on its own, since a sum of several missing ones can cancel. Finding one names it
-and raises, while finding none, or running out of passes, leaves the result
-unchecked, which falls short of showing that the pattern is complete.
-
-The search stays in the mode the entries came from, tangents for forward and
-adjoints for reverse. The other mode need not exist for f, grid_sample having no
-forward rule, and where both exist they can describe different derivatives, as a
-no_grad block does.
-
-status records which of these happened, through p.status and
-summary()["status"], and reads "ok", "inconclusive", "skipped" when verify is
-off, or None when the evaluation never got that far. An unchecked result always
-warns, so a solver loop can stop on one rather than read the status:
+Each result is compared with one directional derivative from autograd. This
+samples one point in one direction, so agreement is evidence rather than proof.
+If the two disagree beyond rounding, jacolor searches, by bisection within a
+budget of AD passes, for an entry of `f`'s derivative that the pattern omits. It
+raises if it finds one, and otherwise reports the result as unchecked. The
+outcome is stored in `p.status` as `"ok"`, `"inconclusive"`, `"skipped"` (when
+`verify=False`) or `None` (when evaluation stopped early). An unchecked result
+also warns, so a solver loop can stop on it:
 
 ```python
 import warnings
 from jacolor import TraceUnchecked, VerificationInconclusive
 
 warnings.simplefilter("error", VerificationInconclusive)
-warnings.simplefilter("error", TraceUnchecked)   # and to refuse an unchecked pattern
+warnings.simplefilter("error", TraceUnchecked)
 ```
 
-The check allows for the precision it can see, which is that of x and of the
-result. If f computes at lower precision inside than either of those shows, say
-float32 inside a float64 function, pass that dtype as verify=torch.float32 and
-the allowance follows it.
+The tolerance follows the dtypes of `x` and of the result. If `f` computes in a
+lower precision internally, for example float32 inside a float64 function, pass
+`verify=torch.float32`.
 
-Detection leans towards holding too many entries rather than too few, because
-the two mistakes cost very different amounts. An extra entry costs a color,
-while a missing entry corrupts more than itself: for a true row of [a, b] a
-pattern of [1, 0] lets both columns share a color and recovery returns
-[a + b, 0], so b disappears and a comes back wrong along with it.
+Detection errs towards extra entries, because a missing entry is worse than an
+extra color: for a true row `[a, b]`, a pattern `[1, 0]` lets both columns share
+a color, and recovery returns `[a + b, 0]`.
 
 ## Supported operations
 
@@ -150,86 +108,50 @@ pattern of [1, 0] lets both columns share a color and recovery returns
 | coupling | addmm.default, bmm.default, convolution.default, mm.default |
 | scatter | index_put.default, index_reduce.default, scatter.src, scatter_add.default, scatter_reduce.two |
 
-nn.Linear is addmm, so ordinary dense layers work. supported_ops() returns the
-same table, and a test keeps this list from drifting away from it.
+`nn.Linear` lowers to `addmm`, so dense layers are covered. `supported_ops()`
+returns the same table, and a test checks that the two agree.
 
 ## Limitations
 
-- One tensor in and one tensor out, with no pytrees and no multiple arguments.
-- mode="hybrid" splits off the rows that force the bound, which covers dense
-  rows rather than general bidirectional coloring. It assumes forward and
-  reverse mode describe the same derivative, and a no_grad block inside f breaks
-  that, since forward mode ignores it. Detection refuses such an f, while with
-  pattern= nothing refuses it and the check reports the result unchecked,
-  because the fault lies with f rather than with the pattern.
-- Real inputs and outputs only. Complex is refused, since forward mode gives the
-  holomorphic derivative and reverse mode its conjugate.
-- Tested on CPU in float64, float32, float16 and bfloat16. In bfloat16 the
-  verification check comes back inconclusive, its rounding allowance running to
-  about half the size of the terms it sums, and in float16 and bfloat16 the
-  trace cannot be checked either and warns TraceUnchecked rather than passing
-  for checked. Both checks are sound in float64 and float32, and GPU is
-  untested.
-- An op with no rule, a custom autograd.Function on the derivative path, a
-  traced program that disagrees with f, and control flow on the values of x are
-  all refused. So is an index computed from x, as in x[x.argmax()] or x[x > 0],
-  since the entries it picks move with x. Comparisons and argmax carry no
-  derivative but stay tracked for exactly this reason.
-- sort, topk, median, kthvalue, cummax and cummin pick elements by value, so
-  their rules claim the whole line each pick could come from. That is sound,
-  and loose by as much as the line is long.
-- CI runs the suite on Python 3.10 to 3.13 against the current torch, with and
-  without the numba extra, and once against the declared floor of torch 2.6.0
-  with scipy 1.14.1. It also smoke tests the built wheel, hybrid included, from
-  outside the source tree.
+- `f` must take one tensor and return one tensor; pytrees and multiple arguments
+  are not supported.
+- Inputs and outputs must be real, because the two AD modes disagree by a
+  conjugate on complex functions.
+- Refused: operators without a rule, custom `autograd.Function`s on the
+  derivative path, traced programs that disagree with `f`, control flow on the
+  values of `x`, and indices computed from `x` (as in `x[x.argmax()]`).
+- `mode="hybrid"` handles dense rows only, not general bidirectional coloring.
+  It assumes forward and reverse mode give the same derivative, which a
+  `no_grad` block inside `f` breaks. Detection refuses such an `f`; with
+  `pattern=` the result is reported as unchecked.
+- `sort`, `topk`, `median`, `kthvalue`, `cummax` and `cummin` select elements by
+  value, so their rules include the whole line any selection could come from.
+  The pattern stays sound but can be much denser than the true one.
+- Tested on CPU only, in float64, float32, float16 and bfloat16. In float16 and
+  bfloat16 the trace check cannot resolve rounding and warns `TraceUnchecked`,
+  and in bfloat16 the verification check is also inconclusive.
+- CI covers Python 3.10 to 3.13 with the current torch, with and without numba,
+  plus torch 2.6.0 with scipy 1.14.1 as the declared floor, and a smoke test of
+  the built wheel.
 
-## Notes
+## How it works
 
-- Patterns are always boolean CSR, since integer dtypes wrap on accumulation and
-  drop entries without saying so.
-- The coloring tries three orderings, natural, largest-first and smallest-last,
-  then iterated greedy from the best of them, which colors again with each color
-  class kept together and so can only keep or lower the count. Incidence-degree
-  is left out because it is dynamic and does not fit the static-permutation
-  kernel. refine goes further by tabu search, one color fewer at a time, until
-  it reaches the lower bound or a budget of moves. On a 10 by 10 periodic grid
-  greedy needs 8 where 5 is possible, and refine finds the 5.
-- The lower bound is the densest line of the pattern, which any coloring has to
-  spend a color on. Reaching it settles the question for that direction and
-  summary() reports it as optimal, though it says nothing about the other
-  direction or about a split. Falling short of it need not mean the heuristic
-  did badly, because the bound itself can be loose. A hybrid split carries a
-  bound of its own, the sum of its two halves, and gets under the
-  single-direction bound by not being a single direction.
-- Propagation is one construction throughout, a left-multiply by a boolean
-  incidence matrix. Row maps (reshape, permute, slicing, broadcast, cat, stack,
-  padding and indexing with a fixed index) are exact, while couplings take a
-  union over a slice, where sums are structural and exact unless terms cancel,
-  and matmul, conv and softmax are conservative on purpose. A put or scatter
-  keeps what it overwrites, since a repeated index has no defined winner in
-  torch and the union of every writer is the sound answer.
-- Rules never read a value that could change between evaluations. The one
-  exception is a mask built from literals in the graph alone, with no input,
-  parameter, captured tensor or random op behind it, which is how export writes
-  r[1] = v. A where over such a mask takes each element from its one branch, so
-  writes into a buffer stay exact.
-- detach is kept through export rather than lowered to alias, so the traced
-  program has f's derivative and the pattern leaves the detached term out.
-- The trace is checked against f in values and in one directional derivative, to
-  a tolerance that follows the dtype. A float32 matmul and its traced form sum
-  in a different order and differ in their last bits, so a float64 bound would
-  refuse f for its arithmetic rather than for its program. Each of the two
-  comparisons answers for the dtype it runs in, which for a derivative is the
-  input's rather than the output's. Where one of them cannot resolve the two
-  programs, either in a dtype whose rounding is wider than the difference
-  between them or on an entry that cancels to far below the scale it is compared
-  against, the pattern is still built and warns TraceUnchecked, which is as much
-  as the check can honestly claim there.
-- Every rule states its tightness in propagate.TIGHTNESS and is held to it, by
-  containment against real Jacobians at several random points and by equality
-  where the claim is exact.
-- to_scipy copies to the CPU and detaches, because scipy holds plain numpy
-  arrays, so nothing about autograd survives the trip.
+`f` is traced with `torch.export` and decomposed to core ATen operators, and each
+operator's rule propagates the pattern by multiplying with a boolean incidence
+matrix. Patterns are stored as boolean
+CSR, because integer dtypes overflow when contributions accumulate and would
+silently drop entries. Each rule declares in `propagate.TIGHTNESS` whether it is
+exact or conservative, and tests check containment against real Jacobians at
+random points, and equality where a rule claims to be exact. Rules never read
+values that can change between evaluations, with one exception: masks built
+only from literals in the graph.
+
+Coloring is greedy over the column intersection graph, trying natural,
+largest-first and smallest-last orderings, followed by iterated greedy. `refine`
+continues with a tabu search until it reaches the lower bound (the densest line
+of the pattern) or exhausts its move budget; on a 10 by 10 periodic grid it finds
+5 colors where greedy needs 8. When a coloring reaches the lower bound,
+`summary()` reports it as optimal for that direction.
 
 ## Install
 
@@ -237,47 +159,42 @@ same table, and a test keeps this list from drifting away from it.
 pip install ".[fast]"          # fast adds the numba coloring kernel
 ```
 
-Without numba, coloring above 10,000 columns warns and falls back to a
-pure-Python loop.
-
-Sources live flat in src/ and the wheel ships them as jacolor, so
-pip install -e . does not work. To work on jacolor, install the extras for their
-dependencies and run the suite from the repo root, where the tests import from
-src/ rather than from the installed copy.
+Without numba, coloring above 10,000 columns warns and uses a pure-Python loop.
+The wheel installs `src/` as the package `jacolor`, which rules out
+`pip install -e .`. For development, install the extras and run the suite from
+the repository root, where the tests import from `src/`:
 
 ```bash
 pip install ".[dev,fast]"
 pytest
 ```
 
-## Measured
+## Measured performance
 
-These are two data points rather than a benchmark, taken on an Apple M5 with
-Python 3.13.9, SciPy 1.16.3, numba 0.62.1 and torch 2.13.0, on one thread in
-float64.
+All measurements are on an Apple M5, single-threaded CPU, float64, torch 2.13.0
+and numba 0.62.1. They cover two problems and should not be read as general
+benchmarks.
 
-The first is a conv layer, 3 to 8 channels over 16x16 with padding 1. Its
-Jacobian is 2048 by 768 and 3.2% dense, and the coloring finds 27 colors, equal
-to the lower bound of in-channels times kernel area.
+[Case study 1](case_studies/cs1_sparse_jacobians/README.md) builds the full
+Jacobian of the Broyden tridiagonal function for n from 64 to 100,000 and
+compares it with `torch.func.jacfwd` and `jacrev`. jacolor found 3 colors at
+every size, the minimum for this pattern, and every result matched the analytic
+derivative. Dense AD is faster up to n = 256: at n = 64, `jacrev` takes 0.088 ms
+against 0.403 ms for a prepared jacolor evaluation. The two cross between
+n = 256 and n = 1024, and at n = 2048 jacolor takes 0.63 ms against 9.1 ms for
+the faster dense method, a 14.6× speedup. Preparation costs 55 to 90 ms once,
+which is recovered after about seven evaluations at n = 2048. At n = 100,000 an
+evaluation takes 11.5 ms and the result occupies 6.9 MiB, where a dense matrix
+would need 74.5 GiB; dense AD was not run above n = 2048. A handwritten
+constructor that knows the formula is 3 to 34 times faster than jacolor, which
+is the cost of detecting the structure and verifying each result.
 
-Setup is paid once and takes 54 ms to read the pattern off the function, almost
-all of it torch.export, plus 2.6 ms to color the 768 columns, which stops at the
-first ordering because that one already reaches the lower bound. Coloring the
-2048 rows for reverse mode costs more, there being more of them.
-
-Each evaluation from a prepared analysis then takes 1.77 ms against 10.7 ms for
-dense jacrev, so 6.0 times faster with verification on, and preparation pays for
-itself after about seven evaluations. Without verification an evaluation takes
-1.13 ms.
-
-Inside that, the AD passes account for 0.16 ms, against 1.70 ms if they are
-looped rather than batched, so assembling the result and checking it is where
-most of the time goes. chunk=8 brings an evaluation to 2.58 ms, which is what
-bounding peak memory costs.
-
-The second is a tridiagonal pattern with n = 100,000 and 299,998 nonzeros, which
-takes 3 colors, again equal to the lower bound, in 0.27 s including the
-transpose product.
+A convolution layer (3 to 8 channels, 16 by 16, padding 1) gives a 2048 by 768
+Jacobian that is 3.2% dense and needs 27 colors, equal to its lower bound.
+Preparation takes about 57 ms, most of it in `torch.export`. A prepared
+evaluation takes 1.77 ms with verification and 1.13 ms without, against 10.7 ms
+for dense `jacrev`. The batched AD passes account for only 0.16 ms of that, so
+assembly and verification dominate.
 
 ## License
 
