@@ -1,0 +1,40 @@
+{
+ "config": {
+  "n_train": 64,
+  "n_val": 16,
+  "length": 256,
+  "hidden": 32,
+  "dt": 0.05,
+  "substeps": 5,
+  "batch": 256,
+  "lr": 0.001,
+  "max_updates": 20000,
+  "eval_every": 25,
+  "train_stream": 101,
+  "val_stream": 202,
+  "torch_seed": 0
+ },
+ "sigma_dyn": [
+  0.001,
+  0.001
+ ],
+ "validation": {
+  "model_rmse": [
+   2.7885902699683427e-05,
+   4.76568946478431e-05
+  ],
+  "persistence_rmse": [
+   0.030642592581172887,
+   0.034086176061340366
+  ],
+  "linear_rmse": [
+   8.67710539188065e-05,
+   0.0034686674869061503
+  ],
+  "best_update": 19825,
+  "pairs": 4080
+ },
+ "train_pairs": 16320,
+ "training_s": 3.6757217500003208,
+ "sha256": "fa2b0060a595470344649584165d25f04d804589f5431fa44865ec64cdc96b8a"
+}
